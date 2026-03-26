@@ -1,0 +1,6 @@
+requests>=2.31
+reportlab>=4.0
+playwright>=1.40
+pypdf>=3.0
+openpyxl>=3.1
+beautifulsoup4>=4.12

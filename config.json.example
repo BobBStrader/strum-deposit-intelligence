@@ -1,0 +1,7 @@
+{
+  "openai_api_key": "YOUR_OPENAI_API_KEY_HERE",
+  "openai_model": "gpt-4.1-mini",
+  "openai_fallback_model": "gpt-4.1",
+  "default_workers": 5,
+  "max_workers": 10
+}
