@@ -33,6 +33,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime, timezone, date
@@ -53,6 +54,121 @@ PRODUCT_GROUP = {
     'auto_loan':    'loan_secured',
     'personal_loan':'loan_unsecured',
 }
+
+# Rate aggregator sources — for institutions that block direct scraping
+AGGREGATOR_SOURCES = {
+    "fdic:6384": {  # PNC Bank
+        "name": "PNC Bank, National Association",
+        "url":  "https://www.depositaccounts.com/banks/pnc-bank.html",
+        # Table indexes on the page: savings=3, money_market=4, checking=5, cd=6, ira_cd=7
+        "tables": {3: "savings", 4: "money_market", 5: "checking", 6: "cd", 7: "ira_cd"},
+    },
+}
+
+
+def scrape_deposit_accounts(conn, institution_id: str, verbose: bool = True) -> int:
+    """
+    Scrape rates from DepositAccounts.com for institutions that block direct scraping.
+    Parses structured HTML tables — no LLM needed.
+    Returns count of rates inserted.
+    """
+    from bs4 import BeautifulSoup
+    from llm_parser import passes_rules
+
+    cfg = AGGREGATOR_SOURCES.get(institution_id)
+    if not cfg:
+        print(f"  No aggregator config for {institution_id}")
+        return 0
+
+    if verbose:
+        print(f"  Fetching {cfg['name']} from DepositAccounts.com...")
+
+    r = requests.get(cfg["url"], timeout=15,
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    tables = soup.find_all("table")
+
+    def _parse_term(name: str):
+        m = re.search(r"(\d+)\s*(Month|Mo|Year|Yr)", name, re.I)
+        if not m:
+            return None
+        val, unit = int(m.group(1)), m.group(2).lower()
+        return val * 12 if ("year" in unit or "yr" in unit) else val
+
+    def _parse_min(s: str):
+        m = re.search(r"\$([0-9,.]+)([km]?)", s.lower())
+        if not m:
+            return None
+        v = float(m.group(1).replace(",", ""))
+        if m.group(2) == "k": v *= 1000
+        if m.group(2) == "m": v *= 1_000_000
+        return v
+
+    rates = []
+    for tbl_idx, product in cfg["tables"].items():
+        if tbl_idx >= len(tables):
+            continue
+        tbl = tables[tbl_idx]
+        for row in tbl.find_all("tr")[1:]:  # skip header
+            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if not cells or not cells[0]:
+                continue
+            apy_str = cells[0].replace("%", "").replace("*", "").replace("†", "").strip()
+            try:
+                apy = float(apy_str) / 100
+            except ValueError:
+                continue
+            min_bal = _parse_min(cells[1]) if len(cells) > 1 else None
+            name    = cells[3] if len(cells) > 3 else ""
+            term    = _parse_term(name) if product in ("cd", "ira_cd") else None
+            rates.append({
+                "product":     product,
+                "term_months": term,
+                "apy":         apy,
+                "min_balance": min_bal,
+                "notes":       name[:80],
+            })
+
+    if verbose:
+        print(f"  Parsed {len(rates)} rates from page")
+
+    now      = datetime.now(timezone.utc).isoformat()
+    week     = date.today().isocalendar()
+    week_str = f"{week[0]}-{week[1]:02d}"
+    inserted = 0
+
+    for r in rates:
+        if not passes_rules(r["product"], r["apy"], r.get("term_months")):
+            continue
+        product = r["product"]
+        conn.execute("""
+            INSERT INTO rates
+            (institution_id, scraped_at, scraped_week, product, group_id,
+             term_months, apy, min_balance, notes, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified')
+        """, (institution_id, now, week_str, product,
+              PRODUCT_GROUP.get(product, "deposit_liquid"),
+              r.get("term_months"), r["apy"], r.get("min_balance"), r.get("notes")))
+        inserted += 1
+
+    conn.commit()
+    conn.execute(
+        "UPDATE institutions SET scrape_status='ok', last_scraped_at=? WHERE id=?",
+        (now, institution_id)
+    )
+    conn.commit()
+
+    if verbose:
+        print(f"  Inserted {inserted} rates")
+        cds = sorted([r for r in rates if r["product"] == "cd" and r["apy"]],
+                     key=lambda x: x.get("term_months") or 0)
+        for c in cds[:6]:
+            term = f"{c['term_months']}mo" if c["term_months"] else "—"
+            print(f"    CD {term} @ {c['apy']*100:.2f}% (min ${c.get('min_balance') or 0:,.0f})")
+
+    return inserted
+
 
 # Known PDF sources per institution
 PDF_SOURCES = {
@@ -478,7 +594,9 @@ def show_missing(conn, city: str, state: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Manual Rate Entry + PDF Scraper")
-    parser.add_argument("--chase",     action="store_true", help="Scrape Chase PDF")
+    parser.add_argument("--chase",      action="store_true", help="Scrape Chase PDF")
+    parser.add_argument("--pnc",        action="store_true", help="Scrape PNC via DepositAccounts.com")
+    parser.add_argument("--aggregator", metavar="INST_ID",   help="Scrape any institution via aggregator (e.g. fdic:6384)")
     parser.add_argument("--pdf-market", nargs=2, metavar=("CITY","STATE"),
                         help="Scrape all PDF-sourced institutions in a market")
     parser.add_argument("--enter",     nargs=2, metavar=("INST_ID","NAME"),
@@ -495,6 +613,16 @@ def main():
         print("\nScraping JPMorgan Chase Bank PDF (split-prompt method)...")
         count = scrape_chase_pdf(conn)
         print(f"\n✅ Chase: {count} rates inserted")
+
+    elif args.pnc:
+        print("\nScraping PNC Bank via DepositAccounts.com...")
+        count = scrape_deposit_accounts(conn, "fdic:6384")
+        print(f"\n✅ PNC: {count} rates inserted")
+
+    elif args.aggregator:
+        print(f"\nScraping {args.aggregator} via aggregator...")
+        count = scrape_deposit_accounts(conn, args.aggregator)
+        print(f"\n✅ {args.aggregator}: {count} rates inserted")
 
     elif args.pdf_market:
         city, state = args.pdf_market

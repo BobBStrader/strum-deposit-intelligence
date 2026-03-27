@@ -8,7 +8,7 @@ A competitive deposit rate intelligence platform that automatically generates we
 
 - **Scrapes publicly available deposit rates** from bank and credit union websites across a target market
 - **Builds a local market peer group** using FDIC branch data (78k+ US branches) and NCUA CU data (4,287 CUs)
-- **Generates a PDF ranking report** by CD term (1 month–5 years) at $10k and $100k minimums, plus savings, money market, and checking
+- **Generates a PDF or Excel ranking report** by CD term (1 month–5 years) at $10k and $100k minimums, plus savings, money market, and checking
 - **Reports show:** institution name, APY, week-over-week change, N/O (not offered), and rate group average
 - **Client institution is highlighted** with a ► marker so they can immediately see where they rank
 
@@ -32,13 +32,15 @@ This tool replicates the core value proposition of S&P's product: a weekly, auto
 FDIC BankFind API ──► branch_geography.py ──► branch_markets table
 NCUA API          ──► cu_geography.py     ──/
                                           │
-Institution websites ──► jina_scraper.py       ──► rates table
-                     ──► playwright_scraper.py ──►
-                     ──► manual_rates.py (PDFs, manual entry)
+Institution websites ──► jina_scraper.py           ──► rates table
+                     ──► playwright_scraper.py     ──►
+                     ──► manual_rates.py            ──►  (PDFs, manual entry)
+                     ──► manual_rates.py --aggregator   (DepositAccounts.com fallback)
                                           │
                      llm_parser.py (gpt-4.1-mini) extracts rates
                                           │
                   peer_group.py ──────────► deposit_ranking_report.py ──► PDF
+                                        └──► export_excel.py          ──► Excel
 ```
 
 **Data flow:**
@@ -119,13 +121,20 @@ python3 scrapers/manual_rates.py --chase   # Chase uses a PDF rate sheet
 ### Step 5 — Generate the report
 
 ```bash
+# PDF
 python3 jobs/deposit_ranking_report.py \
   --client "Your Client CU Name" \
   --market "Baltimore" MD \
   --output /path/to/report.pdf
+
+# Excel (4-sheet workbook: Cover, Liquid Rates, CDs $10k, CDs $100k)
+python3 jobs/export_excel.py \
+  --client "Your Client CU Name" \
+  --market "Baltimore" MD \
+  --output /path/to/report.xlsx
 ```
 
-The PDF will be written to the specified path. Open it to verify rankings look correct before delivering to the client.
+The report will be written to the specified path. Open it to verify rankings look correct before delivering to the client.
 
 ---
 
@@ -204,14 +213,18 @@ Uses OpenAI `gpt-4.1-mini` to extract structured rate data from raw page text or
 ### scrapers/manual_rates.py
 Handles special cases that automated scrapers can't reach:
 - **`--chase`** — Scrapes Chase's public PDF rate sheet using a split-prompt method
+- **`--pnc`** — Scrapes PNC Bank via DepositAccounts.com (Cloudflare-blocked direct). Added 50 rates (CDs, savings, MM, checking).
+- **`--aggregator fdic:XXXX`** — Scrapes any institution via DepositAccounts.com if it's listed there. No LLM needed — parses structured HTML tables directly. Use as a last-resort fallback before manual entry.
 - **`--enter fdic:{cert} "Institution Name"`** — Interactive CLI for manually entering rates for blocked sites
 - **`--missing "City" ST`** — Lists institutions in a market that are missing current rates
 - **JSON bulk import** — For batch-loading rates from an external source
 
+`AGGREGATOR_SOURCES` (dict at top of file) maps institution IDs to their DepositAccounts.com URLs and table indexes. Add new entries here to extend aggregator coverage.
+
 ---
 
 ### jobs/deposit_ranking_report.py
-Main report generator. Queries the database, builds peer rankings for each product/term, and generates a professional PDF using ReportLab.
+Main PDF report generator. Queries the database, builds peer rankings for each product/term, and generates a professional PDF using ReportLab.
 
 ```bash
 python3 jobs/deposit_ranking_report.py \
@@ -224,6 +237,26 @@ python3 jobs/deposit_ranking_report.py \
   --client "Securityplus FCU" \
   --market "Baltimore" MD \
   --text
+```
+
+---
+
+### jobs/export_excel.py
+Excel report generator — outputs the same data as `deposit_ranking_report.py` but as an `.xlsx` workbook. Useful for clients who want to slice and filter the data themselves.
+
+**Sheets:**
+- **Cover** — client name, market, date, peer count
+- **Liquid Rates** — Savings, Money Market, Checking ranked by APY
+- **CDs $10k** — All CD terms (1mo–5yr) ranked, $10k minimum tier
+- **CDs $100k** — All CD terms ranked, $100k minimum tier
+
+Client rows are highlighted in gold with a ► marker. Week-over-week APY changes are shown in green (up) or red (down).
+
+```bash
+python3 jobs/export_excel.py \
+  --client "Securityplus FCU" \
+  --market "Baltimore" MD \
+  --output report.xlsx
 ```
 
 ---
@@ -451,9 +484,25 @@ EOF
 
 | Institution | Issue | Workaround |
 |---|---|---|
-| **PNC Bank** | Cloudflare anti-bot blocks all scrapers | Manual entry: `python3 scrapers/manual_rates.py --enter fdic:1039 "PNC Bank"`, or source from a data vendor |
+| **PNC Bank** | Cloudflare anti-bot blocks direct scrapers | ✅ **Solved** — scraped via DepositAccounts.com: `python3 scrapers/manual_rates.py --pnc` |
 | **The Harbor Bank** | Rate page requires login | No public rates available |
-| **Rosedale Bank** | Rates in a JavaScript iframe widget | Not currently scraped |
+| **Rosedale Bank** | Rates in a JavaScript iframe widget | Check DepositAccounts.com: `python3 scrapers/manual_rates.py --aggregator fdic:{cert}` if listed |
+| **Shore United Bank** | JS-rendered rates | Check DepositAccounts.com aggregator fallback |
+| **FVCbank** | JS-rendered rates | Check DepositAccounts.com aggregator fallback |
+
+### DepositAccounts.com Fallback
+
+For institutions that block direct scraping (Cloudflare, JS iframes, login-gated), use `manual_rates.py` with the aggregator flag. This scrapes [DepositAccounts.com](https://depositaccounts.com) — a public rate aggregator that pre-processes JS-heavy sites — and parses their structured HTML tables directly (no LLM needed).
+
+```bash
+# PNC (pre-configured)
+python3 scrapers/manual_rates.py --pnc
+
+# Any institution listed on DepositAccounts.com
+python3 scrapers/manual_rates.py --aggregator fdic:XXXX
+```
+
+To add a new institution to the aggregator fallback, add an entry to `AGGREGATOR_SOURCES` in `manual_rates.py` with its DepositAccounts.com URL and table index mapping.
 
 **General limitations:**
 - **Rate freshness** — Rates reflect the most recent successful scrape. Some institutions update rates more frequently than weekly; the report may lag by a few days.
