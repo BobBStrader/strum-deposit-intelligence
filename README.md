@@ -451,18 +451,51 @@ Your .NET app then calls `GET http://localhost:8080/report/MD/Baltimore/Security
 
 ## Email Delivery via SendGrid
 
-Strum Platform uses SendGrid for transactional email. The weekly report can be delivered automatically as a PDF and/or Excel attachment.
+> **For the dev team:** This section describes what needs to be built to enable automated weekly report delivery. The report generation scripts are complete — this is the email wrapper layer that ties it together.
 
-### Setup
+Strum Platform uses SendGrid for transactional email. The weekly report is delivered automatically every Monday as a PDF and/or Excel attachment.
+
+---
+
+### What needs to be built
+
+Two new files:
+1. **`jobs/send_report.py`** — SendGrid delivery helper (reusable function)
+2. **`jobs/weekly_delivery.py`** — Weekly orchestrator: generate reports for all clients → email each one
+
+---
+
+### Step 1 — Dependencies
 
 ```bash
 pip install sendgrid
-export SENDGRID_API_KEY="SG.xxxxxxxxxxxxxxxxxxxx"
 ```
 
-Or set `SENDGRID_API_KEY` as an environment variable / secret in your deployment environment (Azure App Service, Docker, etc.).
+Add to `requirements.txt`:
+```
+sendgrid>=6.9
+```
 
-### Delivery Script
+---
+
+### Step 2 — Environment variables (fill these in)
+
+| Variable | Description |
+|---|---|
+| `SENDGRID_API_KEY` | **[PLACEHOLDER — dev team to fill in]** — Your SendGrid API key (starts with `SG.`). Store as an environment variable or Azure App Service secret. Never hardcode. |
+| `REPORT_FROM_EMAIL` | **[PLACEHOLDER — dev team to fill in]** — The verified sender address (e.g. `reports@strumplatform.com`). Must be verified in SendGrid → Settings → Sender Authentication before going live. |
+
+Set locally for testing:
+```bash
+export SENDGRID_API_KEY="SG.xxxxxxxxxxxxxxxxxxxx"   # ← replace with real key
+export REPORT_FROM_EMAIL="reports@strumplatform.com"  # ← replace with verified sender
+```
+
+In production (Azure), set these as App Service application settings or Key Vault references.
+
+---
+
+### Step 3 — Build `jobs/send_report.py`
 
 ```python
 # jobs/send_report.py
@@ -470,12 +503,26 @@ import os, base64, datetime
 import sendgrid
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 
-def send_report(client_name, to_email, pdf_path=None, xlsx_path=None):
-    sg = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+# ── PLACEHOLDERS — dev team to configure ─────────────────────────────────────
+SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY")   # set in environment
+FROM_EMAIL        = os.environ.get("REPORT_FROM_EMAIL")  # must be SendGrid-verified sender
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_report(client_name: str, to_email: str, pdf_path: str = None, xlsx_path: str = None):
+    """
+    Send a deposit ranking report to a client via SendGrid.
+    Attaches PDF and/or Excel depending on which paths are provided.
+    """
+    if not SENDGRID_API_KEY:
+        raise EnvironmentError("SENDGRID_API_KEY environment variable is not set.")
+    if not FROM_EMAIL:
+        raise EnvironmentError("REPORT_FROM_EMAIL environment variable is not set.")
+
+    sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     week = datetime.date.today().strftime("%B %d, %Y")
 
     message = Mail(
-        from_email="reports@strumplatform.com",
+        from_email=FROM_EMAIL,
         to_emails=to_email,
         subject=f"Deposit Ranking Report — {client_name} — Week of {week}",
         html_content=f"""
@@ -483,62 +530,83 @@ def send_report(client_name, to_email, pdf_path=None, xlsx_path=None):
         <p>Your weekly <strong>Deposit Ranking Report</strong> is attached for the week of {week}.</p>
         <p>This report shows how <strong>{client_name}</strong> ranks against local market peers
         across all deposit products — CDs, savings, money market, and checking.</p>
+        <p>Let us know if you have any questions.</p>
         <br>
         <p style="color:#999;font-size:12px;">Powered by Strum Platform™ &mdash; strumplatform.com</p>
         """
     )
 
-    for path, mime, fname in [
-        (pdf_path,  "application/pdf", f"{client_name.replace(' ','_')}_deposit_ranking_{week}.pdf"),
+    # Attach PDF and/or Excel
+    for path, mime, label in [
+        (pdf_path,  "application/pdf",
+         f"{client_name.replace(' ', '_')}_Deposit_Ranking_{week.replace(' ','_')}.pdf"),
         (xlsx_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    f"{client_name.replace(' ','_')}_deposit_ranking_{week}.xlsx"),
+         f"{client_name.replace(' ', '_')}_Deposit_Ranking_{week.replace(' ','_')}.xlsx"),
     ]:
         if path and os.path.exists(path):
             with open(path, "rb") as f:
-                data = base64.b64encode(f.read()).decode()
+                encoded = base64.b64encode(f.read()).decode()
             message.attachment = Attachment(
-                FileContent(data), FileName(fname), FileType(mime), Disposition("attachment")
+                FileContent(encoded), FileName(label), FileType(mime), Disposition("attachment")
             )
 
     response = sg.send(message)
-    print(f"Sent to {to_email} — status {response.status_code}")
+    print(f"  ✅ Sent to {to_email} — HTTP {response.status_code}")
     return response.status_code
 ```
 
-### Full Weekly Cron (Generate + Email)
+---
+
+### Step 4 — Build `jobs/weekly_delivery.py`
 
 ```python
-# jobs/weekly_delivery.py — run every Monday morning
+# jobs/weekly_delivery.py
+# Run every Monday morning via cron.
+# Generates PDF + Excel for each client in clients.json, then emails via SendGrid.
+
 import json, subprocess, tempfile, datetime, os, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from send_report import send_report
 
-clients = json.load(open("clients.json"))
-week = datetime.date.today().strftime("%Y-%m-%d")
+CLIENTS_FILE = os.path.join(os.path.dirname(__file__), "..", "clients.json")
+
+clients = json.load(open(CLIENTS_FILE))
+week    = datetime.date.today().strftime("%Y-%m-%d")
+
+print(f"Weekly delivery — {week} — {len(clients)} client(s)")
 
 for c in clients:
+    print(f"\n→ {c['name']} ({c['market_city']}, {c['market_state']})")
     with tempfile.TemporaryDirectory() as tmpdir:
-        pdf_path  = f"{tmpdir}/{c['name'].replace(' ','_')}_{week}.pdf"
-        xlsx_path = f"{tmpdir}/{c['name'].replace(' ','_')}_{week}.xlsx"
+        slug     = c["name"].replace(" ", "_")
+        pdf_path  = f"{tmpdir}/{slug}_{week}.pdf"
+        xlsx_path = f"{tmpdir}/{slug}_{week}.xlsx"
 
-        subprocess.run(["python3", "jobs/deposit_ranking_report.py",
-            "--client", c["name"], "--market", c["market_city"], c["market_state"],
-            "--output", pdf_path], check=True)
+        # Generate PDF report
+        subprocess.run([
+            "python3", "jobs/deposit_ranking_report.py",
+            "--client", c["name"],
+            "--market", c["market_city"], c["market_state"],
+            "--output", pdf_path
+        ], check=True)
 
-        subprocess.run(["python3", "jobs/export_excel.py",
-            "--client", c["name"], "--market", c["market_city"], c["market_state"],
-            "--output", xlsx_path], check=True)
+        # Generate Excel report
+        subprocess.run([
+            "python3", "jobs/export_excel.py",
+            "--client", c["name"],
+            "--market", c["market_city"], c["market_state"],
+            "--output", xlsx_path
+        ], check=True)
 
+        # Email both attachments
         send_report(c["name"], c["email"], pdf_path=pdf_path, xlsx_path=xlsx_path)
-        print(f"✅ {c['name']} delivered")
+
+print("\nDone.")
 ```
 
-```bash
-# Crontab: every Monday at 7 AM
-0 7 * * 1 cd /path/to/deposit-intelligence && python3 jobs/weekly_delivery.py >> /var/log/deposit_reports.log 2>&1
-```
+---
 
-### clients.json format
+### Step 5 — `clients.json` (one entry per Strum Platform client)
 
 ```json
 [
@@ -546,14 +614,34 @@ for c in clients:
     "name": "Securityplus FCU",
     "market_city": "Baltimore",
     "market_state": "MD",
-    "email": "reports@securityplusfcu.org"
+    "email": "PLACEHOLDER@clientdomain.com"
   }
 ]
 ```
 
-### SendGrid sender identity
+> Replace `PLACEHOLDER@clientdomain.com` with the actual recipient at each client institution before going live.
 
-The `from_email` must be verified in your SendGrid account. Go to **Settings → Sender Authentication** and verify `reports@strumplatform.com` (or whichever address you use) before going live.
+---
+
+### Step 6 — Cron (production)
+
+```bash
+# Runs every Monday at 7:00 AM server time
+0 7 * * 1 cd /path/to/deposit-intelligence && python3 jobs/weekly_delivery.py >> /var/log/deposit_reports.log 2>&1
+```
+
+For Azure deployments, use Azure Logic Apps or a cron-triggered Azure Function instead of a raw crontab.
+
+---
+
+### SendGrid checklist for dev team
+
+- [ ] Obtain SendGrid API key with **Mail Send** permission
+- [ ] Set `SENDGRID_API_KEY` in the deployment environment (never commit to git)
+- [ ] Verify the sender email in SendGrid → **Settings → Sender Authentication**
+- [ ] Set `REPORT_FROM_EMAIL` in the deployment environment
+- [ ] Test with a single client entry in `clients.json` before enabling the full cron
+- [ ] Confirm attachments render correctly in Outlook (primary client email client)
 
 ---
 
