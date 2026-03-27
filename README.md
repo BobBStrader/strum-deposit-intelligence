@@ -1,6 +1,7 @@
 # Strum Deposit Intelligence
+### A Strum Platform™ Feature
 
-A competitive deposit rate intelligence platform that automatically generates weekly ranking reports showing how a client credit union or bank compares to local market peers. Modeled after S&P Global's Deposit Ranking Report (median contract value: $53,344/year per Vendr). Built for the Strum Platform.
+A competitive deposit rate intelligence platform that automatically generates weekly ranking reports showing how a client credit union or bank compares to local market peers. Modeled after S&P Global's Deposit Ranking Report (median contract value: $53,344/year per Vendr). Delivered as a Strum Platform add-on module.
 
 ---
 
@@ -48,6 +49,20 @@ Institution websites ──► jina_scraper.py           ──► rates table
 2. Scrapers pull raw HTML/PDF content from institution websites
 3. `llm_parser.py` uses GPT-4.1-mini to extract structured APY data from unstructured text
 4. `deposit_ranking_report.py` queries the database, builds peer rankings, and renders a ReportLab PDF
+
+---
+
+## Branding
+
+All reports (PDF and Excel) include the **Strum Platform™ logo** in the top-right corner of every sheet/page. The logo file is expected at:
+
+```
+strum_platform_logo_rgba.png   (root of repo)
+```
+
+To update the logo, replace this file with a new RGBA PNG. The recommended size is at least 800px wide for sharp rendering in both Excel and PDF output. The logo is resized automatically — 160px wide on the Excel cover sheet, 110px wide on data sheets, and proportional in the PDF header.
+
+If the file is missing, reports will generate without a logo (no error).
 
 ---
 
@@ -432,7 +447,113 @@ Your .NET app then calls `GET http://localhost:8080/report/MD/Baltimore/Security
     --output /var/reports/securityplus_$(date +\%Y-\%m-\%d).pdf
 ```
 
-For email delivery, integrate with your SMTP service or use the existing email code in `manual_rates.py` as a starting point.
+---
+
+## Email Delivery via SendGrid
+
+Strum Platform uses SendGrid for transactional email. The weekly report can be delivered automatically as a PDF and/or Excel attachment.
+
+### Setup
+
+```bash
+pip install sendgrid
+export SENDGRID_API_KEY="SG.xxxxxxxxxxxxxxxxxxxx"
+```
+
+Or set `SENDGRID_API_KEY` as an environment variable / secret in your deployment environment (Azure App Service, Docker, etc.).
+
+### Delivery Script
+
+```python
+# jobs/send_report.py
+import os, base64, datetime
+import sendgrid
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
+
+def send_report(client_name, to_email, pdf_path=None, xlsx_path=None):
+    sg = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+    week = datetime.date.today().strftime("%B %d, %Y")
+
+    message = Mail(
+        from_email="reports@strumplatform.com",
+        to_emails=to_email,
+        subject=f"Deposit Ranking Report — {client_name} — Week of {week}",
+        html_content=f"""
+        <p>Hi,</p>
+        <p>Your weekly <strong>Deposit Ranking Report</strong> is attached for the week of {week}.</p>
+        <p>This report shows how <strong>{client_name}</strong> ranks against local market peers
+        across all deposit products — CDs, savings, money market, and checking.</p>
+        <br>
+        <p style="color:#999;font-size:12px;">Powered by Strum Platform™ &mdash; strumplatform.com</p>
+        """
+    )
+
+    for path, mime, fname in [
+        (pdf_path,  "application/pdf", f"{client_name.replace(' ','_')}_deposit_ranking_{week}.pdf"),
+        (xlsx_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    f"{client_name.replace(' ','_')}_deposit_ranking_{week}.xlsx"),
+    ]:
+        if path and os.path.exists(path):
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode()
+            message.attachment = Attachment(
+                FileContent(data), FileName(fname), FileType(mime), Disposition("attachment")
+            )
+
+    response = sg.send(message)
+    print(f"Sent to {to_email} — status {response.status_code}")
+    return response.status_code
+```
+
+### Full Weekly Cron (Generate + Email)
+
+```python
+# jobs/weekly_delivery.py — run every Monday morning
+import json, subprocess, tempfile, datetime, os, sys
+sys.path.insert(0, os.path.dirname(__file__))
+from send_report import send_report
+
+clients = json.load(open("clients.json"))
+week = datetime.date.today().strftime("%Y-%m-%d")
+
+for c in clients:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path  = f"{tmpdir}/{c['name'].replace(' ','_')}_{week}.pdf"
+        xlsx_path = f"{tmpdir}/{c['name'].replace(' ','_')}_{week}.xlsx"
+
+        subprocess.run(["python3", "jobs/deposit_ranking_report.py",
+            "--client", c["name"], "--market", c["market_city"], c["market_state"],
+            "--output", pdf_path], check=True)
+
+        subprocess.run(["python3", "jobs/export_excel.py",
+            "--client", c["name"], "--market", c["market_city"], c["market_state"],
+            "--output", xlsx_path], check=True)
+
+        send_report(c["name"], c["email"], pdf_path=pdf_path, xlsx_path=xlsx_path)
+        print(f"✅ {c['name']} delivered")
+```
+
+```bash
+# Crontab: every Monday at 7 AM
+0 7 * * 1 cd /path/to/deposit-intelligence && python3 jobs/weekly_delivery.py >> /var/log/deposit_reports.log 2>&1
+```
+
+### clients.json format
+
+```json
+[
+  {
+    "name": "Securityplus FCU",
+    "market_city": "Baltimore",
+    "market_state": "MD",
+    "email": "reports@securityplusfcu.org"
+  }
+]
+```
+
+### SendGrid sender identity
+
+The `from_email` must be verified in your SendGrid account. Go to **Settings → Sender Authentication** and verify `reports@strumplatform.com` (or whichever address you use) before going live.
 
 ---
 

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.drawing.image import Image as XLImage
 
 from deposit_ranking_report import (
     get_market_rates, get_market_liquid_rates, find_client,
@@ -118,17 +119,40 @@ def build_excel(client_name, city, state, output_path):
     today = date.today().strftime("%m/%d/%Y")
     wb = openpyxl.Workbook()
 
+    # ── Logo path ─────────────────────────────────────────────────────────────
+    logo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'strum_platform_logo_rgba.png')
+    logo_path = os.path.abspath(logo_path)
+
     # ── Cover sheet ───────────────────────────────────────────────────────────
     ws_cover = wb.active
     ws_cover.title = "Cover"
     ws_cover.column_dimensions["A"].width = 50
+    ws_cover.column_dimensions["B"].width = 20
+    ws_cover.column_dimensions["C"].width = 20
+    ws_cover.column_dimensions["D"].width = 20
+
+    # Logo top-right (anchor at D1)
+    if os.path.exists(logo_path):
+        logo_img = XLImage(logo_path)
+        logo_img.width = 160
+        logo_img.height = int(160 * 1206 / 1800)
+        logo_img.anchor = "D1"
+        ws_cover.add_image(logo_img)
 
     ws_cover.cell(row=2, column=1, value="Deposit Ranking Report").font = Font(bold=True, size=20, color=NAVY)
     ws_cover.cell(row=4, column=1, value=f"Client: {client_name}").font = Font(size=13)
     ws_cover.cell(row=5, column=1, value=f"Market: {city}, {state}").font = Font(size=13)
     ws_cover.cell(row=6, column=1, value=f"Generated: {today}").font = Font(size=11, color="666666")
     ws_cover.cell(row=7, column=1, value=f"Peers: {len(peers)} institutions").font = Font(size=11, color="666666")
-    ws_cover.cell(row=9, column=1, value="Powered by Strum Platform").font = Font(size=10, italic=True, color="999999")
+    ws_cover.cell(row=9, column=1, value="Powered by Strum Platform™").font = Font(size=10, italic=True, color="999999")
+
+    def add_sheet_logo(ws):
+        if os.path.exists(logo_path):
+            li = XLImage(logo_path)
+            li.width = 110
+            li.height = int(110 * 1206 / 1800)
+            li.anchor = "D1"
+            ws.add_image(li)
 
     # ── Liquid Rates sheet ────────────────────────────────────────────────────
     ws_liq = wb.create_sheet("Liquid Rates")
@@ -136,8 +160,9 @@ def build_excel(client_name, city, state, output_path):
     ws_liq.column_dimensions["B"].width = 40
     ws_liq.column_dimensions["C"].width = 10
     ws_liq.column_dimensions["D"].width = 12
+    add_sheet_logo(ws_liq)
 
-    row = 1
+    row = 3  # leave room for logo
     for product in LIQUID_PRODUCTS:
         rows = build_liquid_table(liq_meta, liq_rates, product, client_id)
         row = write_table(ws_liq, rows, LIQUID_LABELS[product], row)
@@ -149,8 +174,9 @@ def build_excel(client_name, city, state, output_path):
         ws_cd.column_dimensions["B"].width = 40
         ws_cd.column_dimensions["C"].width = 10
         ws_cd.column_dimensions["D"].width = 12
+        add_sheet_logo(ws_cd)
 
-        row = 1
+        row = 3  # leave room for logo
         for term in CD_TERMS:
             rows = build_term_table(cd_meta, cd_rates, term, min_bal, client_id)
             if not rows:
