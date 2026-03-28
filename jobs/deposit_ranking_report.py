@@ -7,9 +7,14 @@ institution, showing how their rates compare to local market peers.
 Modeled after S&P Global's Deposit Ranking Report format.
 
 Usage:
+    # By city/state (FDIC branch data):
     python3 deposit_ranking_report.py --client "Securityplus FCU" --market "Baltimore" MD
     python3 deposit_ranking_report.py --client "Securityplus FCU" --market "Baltimore" MD --output /tmp/report.pdf
     python3 deposit_ranking_report.py --client "Securityplus FCU" --market "Baltimore" MD --text
+
+    # By MSA/CBSA code (FDIC CBSA_NO or NCUA SMSA code):
+    python3 deposit_ranking_report.py --client "Securityplus FCU" --cbsa 12580
+    python3 deposit_ranking_report.py --client "Desert Financial FCU" --cbsa 38060 --text
 """
 
 import argparse
@@ -64,6 +69,163 @@ def find_client(peers: list[dict], client_name: str) -> dict | None:
             best_score = score
             best = p
     return best if best_score > 0 else None
+
+
+def get_peers_by_cbsa(conn, cbsa_code: str) -> list[dict]:
+    """Return all institutions in a given MSA/CBSA regardless of city."""
+    rows = conn.execute("""
+        SELECT DISTINCT
+            i.id                AS institution_id,
+            i.name,
+            i.type              AS inst_type,
+            i.assets_k,
+            i.cbsa_code,
+            i.cbsa_name,
+            i.website_url
+        FROM institutions i
+        WHERE i.cbsa_code = ?
+        ORDER BY i.assets_k DESC NULLS LAST, i.name
+    """, (str(cbsa_code),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_cbsa_name(conn, cbsa_code: str) -> str:
+    """Look up a human-readable MSA name from cbsa_code."""
+    row = conn.execute(
+        "SELECT cbsa_name FROM institutions WHERE cbsa_code=? AND cbsa_name IS NOT NULL LIMIT 1",
+        (str(cbsa_code),)
+    ).fetchone()
+    if row:
+        return row[0]
+    row = conn.execute(
+        "SELECT cbsa_name FROM branch_markets WHERE cbsa_code=? AND cbsa_name IS NOT NULL LIMIT 1",
+        (str(cbsa_code),)
+    ).fetchone()
+    return row[0] if row else f"MSA {cbsa_code}"
+
+
+def get_market_rates_by_cbsa(conn, cbsa_code: str) -> tuple[dict, dict]:
+    """
+    Pull latest CD rates for all institutions in an MSA/CBSA.
+    Returns: (rates_dict, inst_meta_dict) — same structure as get_market_rates.
+    """
+    peer_ids = [r["institution_id"] for r in get_peers_by_cbsa(conn, cbsa_code)]
+    if not peer_ids:
+        return {}, {}
+    return _fetch_rates_for_ids(conn, peer_ids, "cd")
+
+
+def get_market_liquid_rates_by_cbsa(conn, cbsa_code: str) -> tuple[dict, dict]:
+    """Pull latest savings/MM/checking rates for all institutions in an MSA/CBSA."""
+    peer_ids = [r["institution_id"] for r in get_peers_by_cbsa(conn, cbsa_code)]
+    if not peer_ids:
+        return {}, {}
+    return _fetch_liquid_rates_for_ids(conn, peer_ids)
+
+
+def _inst_meta_for_ids(conn, inst_ids: list[str]) -> dict:
+    """Fetch institution metadata by ID list."""
+    if not inst_ids:
+        return {}
+    placeholders = ",".join("?" * len(inst_ids))
+    rows = conn.execute(
+        f"SELECT id, name, type, assets_k FROM institutions WHERE id IN ({placeholders})",
+        inst_ids
+    ).fetchall()
+    return {r["id"]: {"name": r["name"], "type": r["type"], "assets_k": r["assets_k"]}
+            for r in rows}
+
+
+def _fetch_rates_for_ids(conn, peer_ids: list[str], product: str) -> tuple[dict, dict]:
+    """Generic CD rate fetcher for a list of institution IDs."""
+    if not peer_ids:
+        return {}, {}
+    placeholders = ",".join("?" * len(peer_ids))
+
+    latest = conn.execute(f"""
+        SELECT institution_id, MAX(scraped_week) AS max_week
+        FROM rates WHERE institution_id IN ({placeholders}) AND product=?
+        GROUP BY institution_id
+    """, peer_ids + [product]).fetchall()
+    latest_map = {r["institution_id"]: r["max_week"] for r in latest}
+
+    prior = conn.execute(f"""
+        SELECT institution_id, MAX(scraped_week) AS prior_week
+        FROM rates WHERE institution_id IN ({placeholders}) AND product=?
+        AND scraped_week < COALESCE((
+            SELECT MAX(r2.scraped_week) FROM rates r2
+            WHERE r2.institution_id=rates.institution_id AND r2.product=?
+        ),'9999')
+        GROUP BY institution_id
+    """, peer_ids + [product, product]).fetchall()
+    prior_map = {r["institution_id"]: r["prior_week"] for r in prior}
+
+    rows = conn.execute(f"""
+        SELECT institution_id, term_months, apy, min_balance, scraped_week
+        FROM rates WHERE institution_id IN ({placeholders}) AND product=? AND apy IS NOT NULL
+        ORDER BY term_months, apy DESC
+    """, peer_ids + [product]).fetchall()
+
+    current_rows = [r for r in rows if latest_map.get(r["institution_id"]) == r["scraped_week"]]
+    prior_rows   = {(r["institution_id"], r["term_months"], r["min_balance"] or 0): r["apy"]
+                    for r in rows if prior_map.get(r["institution_id"]) == r["scraped_week"]}
+
+    inst_meta = _inst_meta_for_ids(conn, peer_ids)
+    result = {}
+    for r in current_rows:
+        iid = r["institution_id"]
+        if iid not in result:
+            result[iid] = {}
+        if r["term_months"] is not None and r["apy"] is not None:
+            bal = r["min_balance"] or 0
+            key = (r["term_months"], bal)
+            result[iid][key] = {
+                "apy":       r["apy"],
+                "prior_apy": prior_rows.get((iid, r["term_months"], bal)),
+                "week":      r["scraped_week"],
+            }
+    return result, inst_meta
+
+
+def _fetch_liquid_rates_for_ids(conn, peer_ids: list[str]) -> tuple[dict, dict]:
+    """Generic liquid rate fetcher for a list of institution IDs."""
+    if not peer_ids:
+        return {}, {}
+    placeholders = ",".join("?" * len(peer_ids))
+    products = ('savings', 'money_market', 'checking')
+    prod_ph  = ",".join("?" * len(products))
+
+    latest = conn.execute(f"""
+        SELECT institution_id, product, MAX(scraped_week) AS max_week
+        FROM rates WHERE institution_id IN ({placeholders}) AND product IN ({prod_ph})
+        GROUP BY institution_id, product
+    """, peer_ids + list(products)).fetchall()
+    latest_map = {(r["institution_id"], r["product"]): r["max_week"] for r in latest}
+    if not latest_map:
+        return {}, {}
+
+    rows = conn.execute(f"""
+        SELECT institution_id, product, apy, min_balance, scraped_week
+        FROM rates WHERE institution_id IN ({placeholders}) AND product IN ({prod_ph}) AND apy IS NOT NULL
+        ORDER BY product, apy DESC
+    """, peer_ids + list(products)).fetchall()
+
+    filtered = [r for r in rows if latest_map.get((r["institution_id"], r["product"])) == r["scraped_week"]]
+
+    inst_meta = _inst_meta_for_ids(conn, peer_ids)
+    result = {}
+    for r in filtered:
+        iid = r["institution_id"]
+        if iid not in result:
+            result[iid] = {}
+        if r["product"] and r["apy"] is not None:
+            key = (r["product"], r["min_balance"] or 0)
+            result[iid][key] = {
+                "apy":       r["apy"],
+                "prior_apy": None,
+                "week":      r["scraped_week"],
+            }
+    return result, inst_meta
 
 
 def get_market_rates(conn, city: str, state: str) -> dict:
@@ -294,10 +456,19 @@ def compute_average(rows: list[dict]) -> float | None:
 
 # ── Text Report ───────────────────────────────────────────────────────────────
 
-def render_text_report(conn, city: str, state: str, client_name: str) -> str:
-    peers = get_peers(conn, city, state)
-    rates, inst_meta = get_market_rates(conn, city, state)
-    liq_rates, liq_meta = get_market_liquid_rates(conn, city, state)
+def render_text_report(conn, city: str, state: str, client_name: str,
+                       cbsa_code: str = None) -> str:
+    if cbsa_code:
+        peers    = get_peers_by_cbsa(conn, cbsa_code)
+        rates, inst_meta   = get_market_rates_by_cbsa(conn, cbsa_code)
+        liq_rates, liq_meta = get_market_liquid_rates_by_cbsa(conn, cbsa_code)
+        market_label = get_cbsa_name(conn, cbsa_code)
+    else:
+        peers    = get_peers(conn, city, state)
+        rates, inst_meta   = get_market_rates(conn, city, state)
+        liq_rates, liq_meta = get_market_liquid_rates(conn, city, state)
+        market_label = f"{city.title()}, {state.upper()}"
+
     # Merge inst_meta so liquid-only institutions appear
     merged_meta = {**liq_meta, **inst_meta}
 
@@ -309,7 +480,9 @@ def render_text_report(conn, city: str, state: str, client_name: str) -> str:
     lines.append("=" * 70)
     lines.append(f"  {client_name}")
     lines.append(f"  Deposit Ranking Report — Powered by Strum Platform")
-    lines.append(f"  Market: {city.title()}, {state.upper()}")
+    lines.append(f"  Market: {market_label}")
+    if cbsa_code:
+        lines.append(f"  MSA/CBSA Code: {cbsa_code}")
     lines.append(f"  Generated: {today}")
     lines.append("=" * 70)
 
@@ -388,7 +561,7 @@ def render_text_report(conn, city: str, state: str, client_name: str) -> str:
 # ── PDF Report ────────────────────────────────────────────────────────────────
 
 def render_pdf_report(conn, city: str, state: str, client_name: str,
-                      output_path: str) -> str:
+                      output_path: str, cbsa_code: str = None) -> str:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -399,9 +572,17 @@ def render_pdf_report(conn, city: str, state: str, client_name: str,
     )
     from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
-    peers = get_peers(conn, city, state)
-    rates, inst_meta = get_market_rates(conn, city, state)
-    liq_rates, liq_meta = get_market_liquid_rates(conn, city, state)
+    if cbsa_code:
+        peers    = get_peers_by_cbsa(conn, cbsa_code)
+        rates, inst_meta    = get_market_rates_by_cbsa(conn, cbsa_code)
+        liq_rates, liq_meta = get_market_liquid_rates_by_cbsa(conn, cbsa_code)
+        market_label = get_cbsa_name(conn, cbsa_code)
+    else:
+        peers    = get_peers(conn, city, state)
+        rates, inst_meta    = get_market_rates(conn, city, state)
+        liq_rates, liq_meta = get_market_liquid_rates(conn, city, state)
+        market_label = f"{city.title()}, {state.upper()}"
+
     merged_meta = {**liq_meta, **inst_meta}
     client = find_client(peers, client_name)
     client_id = client["institution_id"] if client else None
@@ -442,8 +623,9 @@ def render_pdf_report(conn, city: str, state: str, client_name: str,
     story.append(Paragraph(client_name, title_style))
     story.append(Paragraph("Deposit Ranking Report", title_style))
     story.append(HRFlowable(width="100%", thickness=2, color=GOLD, spaceAfter=6))
+    msa_suffix = f"  |  MSA/CBSA: {cbsa_code}" if cbsa_code else ""
     story.append(Paragraph(
-        f"Market: {city.title()}, {state.upper()}  |  Generated: {today}  |  Powered by Strum Platform",
+        f"Market: {market_label}{msa_suffix}  |  Generated: {today}  |  Powered by Strum Platform",
         sub_style))
     story.append(Spacer(1, 0.15*inch))
 
@@ -627,22 +809,34 @@ def render_pdf_report(conn, city: str, state: str, client_name: str,
 def main():
     parser = argparse.ArgumentParser(description="Deposit Ranking Report Generator")
     parser.add_argument("--client",  required=True, help="Client institution name")
-    parser.add_argument("--market",  nargs=2, metavar=("CITY", "STATE"), required=True)
+    parser.add_argument("--market",  nargs=2, metavar=("CITY", "STATE"),
+                        help="Market by city + state (e.g. --market Baltimore MD)")
+    parser.add_argument("--cbsa",    metavar="CODE",
+                        help="Market by MSA/CBSA code (e.g. --cbsa 12580 for Baltimore)")
     parser.add_argument("--output",  default=None, help="PDF output path")
     parser.add_argument("--text",    action="store_true", help="Print text report to stdout")
     args = parser.parse_args()
 
-    city, state = args.market
+    if not args.market and not args.cbsa:
+        parser.error("Specify either --market CITY STATE or --cbsa CODE")
+
+    city = state = ""
+    cbsa_code = None
+    if args.cbsa:
+        cbsa_code = str(args.cbsa).strip()
+    if args.market:
+        city, state = args.market
+
     conn = get_conn()
 
     if args.text or not args.output:
-        report = render_text_report(conn, city, state, args.client)
+        report = render_text_report(conn, city, state, args.client, cbsa_code=cbsa_code)
         print(report)
 
     if args.output or not args.text:
         out = args.output or f"/tmp/{args.client.replace(' ','_')}_DepositRanking_{date.today()}.pdf"
         print(f"Generating PDF → {out}")
-        render_pdf_report(conn, city, state, args.client, out)
+        render_pdf_report(conn, city, state, args.client, out, cbsa_code=cbsa_code)
         print(f"✅ PDF saved: {out}")
 
 

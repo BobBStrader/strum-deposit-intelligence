@@ -45,12 +45,24 @@ def init_branch_table(conn: sqlite3.Connection):
             latitude    REAL,
             longitude   REAL,
             market_key  TEXT NOT NULL,      -- '{city}|{state}' normalized lowercase
+            cbsa_code   TEXT,               -- Census CBSA/MSA code (e.g. '42660')
+            cbsa_name   TEXT,               -- Metro area name (e.g. 'Seattle-Tacoma-Bellevue, WA')
             loaded_at   TEXT NOT NULL       -- ISO timestamp of import
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bm_market ON branch_markets(market_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bm_cert   ON branch_markets(cert)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bm_state  ON branch_markets(state)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bm_cbsa   ON branch_markets(cbsa_code)")
+    # Migration: add cbsa columns if they don't exist yet
+    for col_sql in [
+        "ALTER TABLE branch_markets ADD COLUMN cbsa_code TEXT",
+        "ALTER TABLE branch_markets ADD COLUMN cbsa_name TEXT",
+    ]:
+        try:
+            conn.execute(col_sql)
+        except Exception:
+            pass  # already exists
     conn.commit()
 
 
@@ -58,7 +70,7 @@ def init_branch_table(conn: sqlite3.Connection):
 
 def fetch_branches(state: str = None, offset: int = 0) -> dict:
     params = {
-        "fields": "CERT,NAMEFULL,CITY,STNAME,STALP,ZIPBR,LATITUDE,LONGITUDE",
+        "fields": "CERT,NAME,CITY,STNAME,STALP,ZIP,LATITUDE,LONGITUDE,CBSA_NO,CBSA_METRO_NAME",
         "limit":  PAGE_SIZE,
         "offset": offset,
         "output": "json",
@@ -92,31 +104,46 @@ def load_branches(conn: sqlite3.Connection, state: str = None, verbose: bool = T
     rows = first["data"]
     while True:
         inserts = []
+        cbsa_updates = []  # (cbsa_code, cbsa_name, inst_id)
         for row in rows:
             d = row["data"]
-            loc_id  = str(d.get("ID", ""))
-            cert    = str(d.get("CERT", ""))
-            name    = d.get("NAMEFULL", "")
-            city    = (d.get("CITY") or "").strip().title()
-            state_s = (d.get("STALP") or "").strip().upper()
-            sname   = d.get("STNAME", "")
-            zipbr   = d.get("ZIPBR", "")
-            lat     = d.get("LATITUDE")
-            lon     = d.get("LONGITUDE")
-            mkey    = f"{city.lower()}|{state_s.lower()}"
+            loc_id    = str(d.get("ID", ""))
+            cert      = str(d.get("CERT", ""))
+            name      = d.get("NAME", "")
+            city      = (d.get("CITY") or "").strip().title()
+            state_s   = (d.get("STALP") or "").strip().upper()
+            sname     = d.get("STNAME", "")
+            zipbr     = d.get("ZIP", "")
+            lat       = d.get("LATITUDE")
+            lon       = d.get("LONGITUDE")
+            cbsa_code = str(d.get("CBSA_NO") or "").strip() or None
+            cbsa_name = (d.get("CBSA_METRO_NAME") or "").strip() or None
+            mkey      = f"{city.lower()}|{state_s.lower()}"
 
             if not (loc_id and cert and city and state_s):
                 total_skipped += 1
                 continue
 
             inserts.append((loc_id, cert, name, city, state_s, sname,
-                            zipbr, lat, lon, mkey, now))
+                            zipbr, lat, lon, mkey, cbsa_code, cbsa_name, now))
+
+            # Queue cbsa backfill for institutions table (main office branch only; we take any non-null)
+            if cbsa_code:
+                cbsa_updates.append((cbsa_code, cbsa_name, f"fdic:{cert}"))
 
         conn.executemany("""
             INSERT OR REPLACE INTO branch_markets
-            (id, cert, inst_name, city, state, state_name, zip, latitude, longitude, market_key, loaded_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            (id, cert, inst_name, city, state, state_name, zip, latitude, longitude,
+             market_key, cbsa_code, cbsa_name, loaded_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, inserts)
+
+        # Backfill cbsa_code/cbsa_name onto institutions (overwrite if new value)
+        if cbsa_updates:
+            conn.executemany("""
+                UPDATE institutions SET cbsa_code=?, cbsa_name=?
+                WHERE id=? AND (cbsa_code IS NULL OR cbsa_code='')
+            """, cbsa_updates)
         conn.commit()
         total_loaded += len(inserts)
 

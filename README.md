@@ -1,16 +1,19 @@
 # Strum Deposit Intelligence
 ### A Strum Platform™ Feature
 
-A competitive deposit rate intelligence platform that automatically generates weekly ranking reports showing how a client credit union or bank compares to local market peers. Modeled after S&P Global's Deposit Ranking Report (median contract value: $53,344/year per Vendr). Delivered as a Strum Platform add-on module.
+A competitive rate intelligence platform that automatically generates ranking reports showing how a client credit union or bank compares to local market peers across **deposits, auto loans, and mortgages**. Modeled after S&P Global's Deposit and Loan Ranking Reports. Delivered as a Strum Platform add-on module.
 
 ---
 
 ## What It Does
 
-- **Scrapes publicly available deposit rates** from bank and credit union websites across a target market
+- **Scrapes publicly available rates** (deposits, auto loans, mortgages) from bank and credit union websites across a target market
 - **Builds a local market peer group** using FDIC branch data (78k+ US branches) and NCUA CU data (4,287 CUs)
-- **Generates a PDF or Excel ranking report** by CD term (1 month–5 years) at $10k and $100k minimums, plus savings, money market, and checking
-- **Reports show:** institution name, APY, week-over-week change, N/O (not offered), and rate group average
+- **Generates PDF ranking reports** for three report types:
+  - **Deposit Ranking Report** — CDs by term ($10k/$100k), savings, money market, checking
+  - **Loan Ranking Report** — New/used auto loans by term (36–84mo), personal loans
+  - **Mortgage Ranking Report** — Fixed (10/15/20/30yr) and ARM products, conforming
+- **Reports show:** institution name, interest rate, APR, week-over-week change, N/O (not offered), and rate group average
 - **Client institution is highlighted** with a ► marker so they can immediately see where they rank
 
 ---
@@ -20,10 +23,16 @@ A competitive deposit rate intelligence platform that automatically generates we
 | | |
 |---|---|
 | **S&P Global Deposit Ranking Report** | $21K–$217K/year (median **$53,344**, based on 47 purchases via Vendr) |
-| **Strum Platform opportunity** | $3–5K/year per client — undercutting S&P by **80%+** |
-| **Data costs** | $0 — all data sourced from public websites, no data vendor fees |
+| **S&P Global Loan Ranking Report** | Similar pricing — separate SKU |
+| **Strum Platform opportunity** | $3–5K/year per client per report type — undercutting S&P by **80%+** |
+| **Data costs** | ~$0 — all data sourced from public websites via web scraping + GPT extraction |
 
-This tool replicates the core value proposition of S&P's product: a weekly, auto-generated, peer-ranked rate comparison delivered as a professional PDF report. The key differentiator is that we source data from public websites rather than paying data vendors, which makes the economics dramatically better.
+This tool replicates the core value proposition of S&P's product: auto-generated, peer-ranked rate comparisons delivered as professional PDF reports. The key differentiator is that we source data from public websites rather than paying data vendors ($500–$2,000+/mo for Datatrac, S&P's underlying source), which makes the unit economics dramatically better.
+
+**Baltimore market coverage (as of 2026-03-28):**
+- Auto loans: 7/9 S&P benchmark institutions captured
+- 15yr Fixed Mortgage: 9/12 S&P benchmark institutions captured
+- Remaining N/O = institutions that don't publish public rates (Chase auto, Rosedale, etc.) — same limitation S&P notes
 
 ---
 
@@ -33,22 +42,25 @@ This tool replicates the core value proposition of S&P's product: a weekly, auto
 FDIC BankFind API ──► branch_geography.py ──► branch_markets table
 NCUA API          ──► cu_geography.py     ──/
                                           │
-Institution websites ──► jina_scraper.py           ──► rates table
-                     ──► playwright_scraper.py     ──►
-                     ──► manual_rates.py            ──►  (PDFs, manual entry)
-                     ──► manual_rates.py --aggregator   (DepositAccounts.com fallback)
+Institution websites ──► jina_scraper.py         ──┐
+                     ──► playwright_scraper.py   ──┤──► rates table (apy + apr columns)
+                     ──► manual_rates.py          ──┘  (PDFs, manual entry, aggregators)
                                           │
-                     llm_parser.py (gpt-4.1-mini) extracts rates
+                     llm_parser.py (gpt-4o-mini) extracts rates + APR
                                           │
                   peer_group.py ──────────► deposit_ranking_report.py ──► PDF
+                                        ├──► loan_ranking_report.py   ──► PDF
+                                        ├──► mortgage_ranking_report.py ► PDF
                                         └──► export_excel.py          ──► Excel
 ```
 
 **Data flow:**
 1. Branch geography loaders pull institution registries from FDIC and NCUA APIs into a local SQLite database
-2. Scrapers pull raw HTML/PDF content from institution websites
-3. `llm_parser.py` uses GPT-4.1-mini to extract structured APY data from unstructured text
-4. `deposit_ranking_report.py` queries the database, builds peer rankings, and renders a ReportLab PDF
+2. Scrapers pull raw HTML content from institution websites — Jina for static pages, Playwright for JS-rendered ones
+3. `llm_parser.py` uses GPT-4o-mini to extract structured rate + APR data from unstructured text
+4. Report generators query the database, build peer rankings, and render ReportLab PDFs
+
+**Scraper selection strategy:** Jina first (free, fast), Playwright fallback (handles JS), N/O for sites that block all scrapers or don't publish rates publicly. See `SCRAPER_STRATEGY.md` for full decision tree and per-institution notes.
 
 ---
 
@@ -173,6 +185,29 @@ The report will be written to the specified path. Open it to verify rankings loo
    ```bash
    python3 jobs/deposit_ranking_report.py --client "..." --market "Seattle" WA --output report.pdf
    ```
+
+---
+
+## Report Types
+
+### Deposit Ranking Report (`jobs/deposit_ranking_report.py`)
+CDs by term (1mo–5yr) at $10k and $100k minimums, plus savings, money market, and checking. Shows APY + week-over-week change.
+
+### Loan Ranking Report (`jobs/loan_ranking_report.py`)
+New and used auto loans by term (36/48/60/72/84mo), personal loans. Shows Rate + APR columns side by side.
+
+```bash
+python3 jobs/loan_ranking_report.py --client "Securityplus FCU" --market Baltimore MD --text
+python3 jobs/loan_ranking_report.py --client "Securityplus FCU" --market Baltimore MD --output report.pdf
+```
+
+### Mortgage Ranking Report (`jobs/mortgage_ranking_report.py`)
+Fixed rate mortgages (10/15/20/30yr conforming) and ARM products (1/3/5/7/10yr, annual and 6-month adjust). Shows Rate + APR columns.
+
+```bash
+python3 jobs/mortgage_ranking_report.py --client "Securityplus FCU" --market Baltimore MD --text
+python3 jobs/mortgage_ranking_report.py --client "Securityplus FCU" --market Baltimore MD --output report.pdf
+```
 
 ---
 
@@ -305,10 +340,17 @@ All scraped rates. Append-only — records are never deleted (historical).
 | Column | Type | Description |
 |---|---|---|
 | `institution_id` | TEXT FK | References `institutions.id` |
-| `product` | TEXT | `cd`, `savings`, `money_market`, `checking` |
-| `term_months` | INTEGER | CD term in months (null for non-CD products) |
-| `apy` | REAL | Decimal: `0.045` = 4.5% |
-| `min_balance` | INTEGER | Minimum balance in dollars |
+| `product` | TEXT | `cd`, `savings`, `money_market`, `checking`, `new_auto_loan`, `used_auto_loan`, `personal_loan`, `mortgage_fixed`, `mortgage_arm` |
+| `term_months` | INTEGER | CD term or mortgage term in months (e.g. 180=15yr, 360=30yr) |
+| `apy` | REAL | Interest rate as decimal: `0.0449` = 4.49% |
+| `apr` | REAL | APR as decimal: `0.0590` = 5.90% (null if not published separately) |
+| `min_balance` | INTEGER | Minimum balance in dollars (deposits) |
+| `loan_term_label` | TEXT | Human-readable term label (e.g. "36 months") |
+| `vehicle_age_years` | INTEGER | For used auto: max vehicle age |
+| `arm_initial_years` | INTEGER | For ARMs: initial fixed period in years |
+| `arm_adjust_months` | INTEGER | For ARMs: adjustment frequency in months |
+| `conforming` | INTEGER | 1=conforming, 0=jumbo, null=unknown |
+| `rate_type` | TEXT | `fixed` or `arm` (mortgages) |
 | `scraped_week` | TEXT | ISO week: `YYYY-WW` |
 | `confidence` | TEXT | `verified` or `unverified` |
 
@@ -691,13 +733,29 @@ EOF
 
 ## Known Limitations
 
+### Deposit Rates
 | Institution | Issue | Workaround |
 |---|---|---|
 | **PNC Bank** | Cloudflare anti-bot blocks direct scrapers | ✅ **Solved** — scraped via DepositAccounts.com: `python3 scrapers/manual_rates.py --pnc` |
 | **The Harbor Bank** | Rate page requires login | No public rates available |
-| **Rosedale Bank** | Rates in a JavaScript iframe widget | Check DepositAccounts.com: `python3 scrapers/manual_rates.py --aggregator fdic:{cert}` if listed |
+| **Rosedale Bank** | Rates in a JavaScript iframe widget | Check DepositAccounts.com aggregator fallback |
 | **Shore United Bank** | JS-rendered rates | Check DepositAccounts.com aggregator fallback |
 | **FVCbank** | JS-rendered rates | Check DepositAccounts.com aggregator fallback |
+
+### Loan & Mortgage Rates
+| Institution | Issue | Workaround |
+|---|---|---|
+| **JPMorgan Chase** | Auto rates not published publicly. Mortgage rates are JS-only widget (no static fallback). | N/O — requires Datatrac paid feed |
+| **PNC Bank** | Auto loan page returns 404; only publishes a range. Mortgage: Jina works, Playwright fails (HTTP/2). | Auto: store range floor. Mortgage: use Jina. |
+| **Point Breeze CU** | Was on wrong domain (`pointbreezecu.com`). Real domain: `pbcu.com`. Mortgage page is a calculator, no rate table. | Auto loans: ✅ via Playwright. Mortgage: N/O. |
+| **Peake FCU** | Mortgage page shows a calculator/CTA, not a rate table. | Auto loans: ✅ via Playwright. Mortgage: N/O. |
+| **Rosedale Bank** | No public rate table for loans or mortgages. | N/O |
+| **First Financial of MD** | Not in institution DB — needs to be added. | Add via FDIC cert lookup |
+| **Loan aggregators (Bankrate, NerdWallet, LendingTree)** | Hide lender names behind lead-gen forms. Not useful for competitive reports. | N/A — use direct scraping instead |
+
+**Why N/O is acceptable:** S&P's own reports show N/O for institutions that don't publish public rates. It's honest and accurate — the institution simply chose not to publish. Clients understand this. The alternative (Datatrac) costs $500–$2,000+/mo.
+
+See `SCRAPER_STRATEGY.md` for full technical details on each institution.
 
 ### DepositAccounts.com Fallback
 

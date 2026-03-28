@@ -32,15 +32,19 @@ def init_db():
         group_id TEXT NOT NULL REFERENCES product_groups(group_id)
     );
     INSERT OR IGNORE INTO product_group_map VALUES
-        ('savings',       'deposit_liquid'),
-        ('checking',      'deposit_liquid'),
-        ('money_market',  'deposit_liquid'),
-        ('cd',            'deposit_term'),
-        ('ira_cd',        'deposit_term'),
-        ('mortgage',      'loan_secured'),
-        ('home_equity',   'loan_secured'),
-        ('auto_loan',     'loan_secured'),
-        ('personal_loan', 'loan_unsecured');
+        ('savings',         'deposit_liquid'),
+        ('checking',        'deposit_liquid'),
+        ('money_market',    'deposit_liquid'),
+        ('cd',              'deposit_term'),
+        ('ira_cd',          'deposit_term'),
+        ('mortgage',        'loan_secured'),
+        ('home_equity',     'loan_secured'),
+        ('auto_loan',       'loan_secured'),
+        ('personal_loan',   'loan_unsecured'),
+        ('new_auto_loan',   'loan_secured'),
+        ('used_auto_loan',  'loan_secured'),
+        ('mortgage_fixed',  'loan_secured'),
+        ('mortgage_arm',    'loan_secured');
 
     -- Institutions registry
     CREATE TABLE IF NOT EXISTS institutions (
@@ -50,8 +54,12 @@ def init_db():
         charter                 INTEGER,
         state                   TEXT,
         assets_k                INTEGER,               -- assets in thousands
+        cbsa_code               TEXT,                  -- Census CBSA code (e.g. '42660')
+        cbsa_name               TEXT,                  -- Metro name (e.g. 'Seattle-Tacoma-Bellevue, WA')
         website_url             TEXT,
         rates_url               TEXT,
+        loan_rates_url          TEXT,   -- separate URL for loan rates page
+        mortgage_rates_url      TEXT,   -- separate URL for mortgage rates page
         url_found_at            TEXT,
         last_scraped_at         TEXT,
         scrape_status           TEXT DEFAULT 'pending',
@@ -63,6 +71,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_inst_type   ON institutions(type);
     CREATE INDEX IF NOT EXISTS idx_inst_state  ON institutions(state);
     CREATE INDEX IF NOT EXISTS idx_inst_assets ON institutions(assets_k DESC);
+    CREATE INDEX IF NOT EXISTS idx_inst_cbsa   ON institutions(cbsa_code);
 
     -- All rates — historical records kept (never overwritten)
     -- Each scrape week creates new rows; old rows stay for trend tracking
@@ -78,7 +87,15 @@ def init_db():
         min_balance      REAL,
         notes            TEXT,
         confidence       TEXT DEFAULT 'unverified', -- verified|unverified|rejected
-        verified_snippet TEXT
+        verified_snippet TEXT,
+        -- Loan / mortgage specific fields
+        loan_term_label  TEXT,    -- human label: "36Mo New Auto 25k", "5/1 ARM Conforming"
+        vehicle_age_years INTEGER, -- auto loans: 0=new, 2=used 2yr, 4=used 4yr
+        loan_amount_k    INTEGER,  -- reference loan amount in thousands
+        rate_type        TEXT,     -- 'fixed' | 'arm' | 'apr'
+        arm_initial_years INTEGER, -- ARMs: initial fixed period in years (3,5,7,10)
+        arm_adjust_months INTEGER, -- ARMs: adjustment period in months (12=yearly, 6=6mo)
+        conforming       INTEGER   -- 1 if conforming loan
     );
     CREATE INDEX IF NOT EXISTS idx_rates_inst    ON rates(institution_id);
     CREATE INDEX IF NOT EXISTS idx_rates_week    ON rates(scraped_week);
@@ -157,6 +174,59 @@ def migrate():
             conn.commit()
         except Exception:
             pass  # column already exists
+    # Add MSA/CBSA columns (added 2026-03-28)
+    for sql in [
+        "ALTER TABLE institutions ADD COLUMN cbsa_code TEXT",
+        "ALTER TABLE institutions ADD COLUMN cbsa_name TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_inst_cbsa ON institutions(cbsa_code)",
+    ]:
+        try:
+            c.execute(sql)
+            conn.commit()
+        except Exception:
+            pass  # already exists
+
+    # Add loan/mortgage URL columns to institutions (added 2026-03-28)
+    for sql in [
+        "ALTER TABLE institutions ADD COLUMN loan_rates_url TEXT",
+        "ALTER TABLE institutions ADD COLUMN mortgage_rates_url TEXT",
+    ]:
+        try:
+            c.execute(sql)
+            conn.commit()
+        except Exception:
+            pass  # already exists
+
+    # Add loan/mortgage rate fields to rates table (added 2026-03-28)
+    for sql in [
+        "ALTER TABLE rates ADD COLUMN loan_term_label TEXT",
+        "ALTER TABLE rates ADD COLUMN vehicle_age_years INTEGER",
+        "ALTER TABLE rates ADD COLUMN loan_amount_k INTEGER",
+        "ALTER TABLE rates ADD COLUMN rate_type TEXT",
+        "ALTER TABLE rates ADD COLUMN arm_initial_years INTEGER",
+        "ALTER TABLE rates ADD COLUMN arm_adjust_months INTEGER",
+        "ALTER TABLE rates ADD COLUMN conforming INTEGER",
+        "ALTER TABLE rates ADD COLUMN apr REAL",  # APR as decimal (added 2026-03-28)
+    ]:
+        try:
+            c.execute(sql)
+            conn.commit()
+        except Exception:
+            pass  # already exists
+
+    # Add new loan product types to product_group_map
+    for product, group_id in [
+        ('new_auto_loan',  'loan_secured'),
+        ('used_auto_loan', 'loan_secured'),
+        ('mortgage_fixed', 'loan_secured'),
+        ('mortgage_arm',   'loan_secured'),
+    ]:
+        try:
+            c.execute("INSERT OR IGNORE INTO product_group_map VALUES (?,?)", (product, group_id))
+            conn.commit()
+        except Exception:
+            pass
+
     # Remove old columns we no longer use (SQLite: recreate isn't worth it, just ignore)
     conn.close()
 

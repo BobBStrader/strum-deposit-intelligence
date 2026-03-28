@@ -205,22 +205,33 @@ def fetch_playwright(url, timeout=25):
 
 def fetch_page(url):
     """
-    Main fetch entry point:
-      1. Jina (fast, token cost)
-      2. Direct HTTP (free, plain HTML only)
-      3. Playwright (free, handles JS rendering)
+    Main fetch entry point — tries in order:
+      1. Tavily Extract (primary) — AI-powered, handles JS, best signal quality
+      2. Jina Reader (fallback)   — authenticated, cleans to markdown
+      3. Direct HTTP              — free, plain HTML only
+      4. Playwright               — headless Chromium, last resort
     Returns (text, source).
     """
+    # 1. Tavily Extract (primary)
+    try:
+        from tavily_scraper import fetch_tavily, has_rate_signals as tavily_signals
+        text_tv = fetch_tavily(url)
+        if text_tv and tavily_signals(text_tv):
+            return text_tv, 'tavily'
+    except ImportError:
+        pass  # tavily_scraper not available
+
+    # 2. Jina (fallback)
     text = fetch_jina(url)
     if text and has_rate_signals(text):
         return text, 'jina'
 
-    # Jina got nothing useful — try direct first (cheaper than Playwright)
+    # 3. Direct HTTP (free, plain HTML only)
     text_direct = fetch_direct(url)
     if text_direct and has_rate_signals(text_direct):
         return text_direct, 'direct'
 
-    # Last resort: Playwright headless browser
+    # 4. Last resort: Playwright headless browser
     text_pw = fetch_playwright(url)
     if text_pw and has_rate_signals(text_pw):
         return text_pw, 'playwright'
@@ -354,12 +365,82 @@ def _scrape_one(row):
     return inst_id, 'ok', len(section), source
 
 
-def run_scraper(limit=None, type_filter=None, force=False, workers=1):
+def run_scraper_tavily_batch(rows, force=False):
+    """
+    Scrape a batch of institutions using Tavily Extract in bulk.
+    Sends all URLs in a single Tavily call (up to 20 per batch).
+    Returns list of institution_ids successfully scraped.
+    Falls back to per-institution fetch_page() for failures.
+    """
+    from tavily_scraper import fetch_tavily_batch, has_rate_signals as tv_signals, estimate_credits
+
+    conn = get_conn()
+    c    = conn.cursor()
+    now  = datetime.now(timezone.utc).isoformat()
+
+    # Build url → row mapping
+    url_to_row = {row['rates_url']: row for row in rows if row['rates_url']}
+    urls       = list(url_to_row.keys())
+
+    if not urls:
+        conn.close()
+        return []
+
+    print(f"  Tavily batch: {len(urls)} URLs (~{estimate_credits(len(urls))} credits)")
+    batch_results = fetch_tavily_batch(urls)
+
+    scraped_ids = []
+    fallback_rows = []
+
+    for url, text in batch_results.items():
+        row     = url_to_row[url]
+        inst_id = row['id']
+        name    = row['name']
+
+        if text and tv_signals(text):
+            section = extract_rate_section(text)
+            c.execute("""UPDATE institutions
+                         SET last_scraped_at=?, scrape_status='ok', raw_section=?
+                         WHERE id=?""", (now, section, inst_id))
+            conn.commit()
+            scraped_ids.append(inst_id)
+            print(f"    ✅ {name[:45]:<45} ({len(section)} chars, tavily)")
+        else:
+            # Queue for per-institution fallback
+            fallback_rows.append(row)
+            print(f"    ⚠️  {name[:45]:<45} Tavily miss — queued for fallback")
+
+    conn.close()
+
+    # Fallback: run individual fetch_page() for misses
+    if fallback_rows:
+        print(f"  Fallback scraping {len(fallback_rows)} institutions...")
+        conn2 = get_conn()
+        c2    = conn2.cursor()
+        for row in fallback_rows:
+            inst_id   = row['id']
+            name      = row['name']
+            rates_url = row['rates_url']
+            result    = _scrape_one(row)
+            _, status, section_len, source = result
+            if status == 'ok':
+                scraped_ids.append(inst_id)
+                print(f"    ✅ {name[:45]:<45} ({section_len} chars, {source})")
+            else:
+                print(f"    ❌ {name[:45]:<45} {status}")
+            time.sleep(DELAY)
+        conn2.close()
+
+    return scraped_ids
+
+
+def run_scraper(limit=None, type_filter=None, force=False, workers=1, use_tavily_batch=True):
     """
     Scrape rate pages and store raw_section in institutions table.
     Returns list of institution_ids that were successfully scraped.
 
-    workers: number of concurrent threads (default 1 = serial, max 20)
+    workers:           number of concurrent threads (default 1 = serial, max 20)
+    use_tavily_batch:  send all URLs to Tavily in bulk before falling back (default True)
     """
     import threading
     import concurrent.futures
@@ -382,7 +463,20 @@ def run_scraper(limit=None, type_filter=None, force=False, workers=1):
     rows = c.execute(query).fetchall()
     conn.close()
     total = len(rows)
-    print(f"Scraper: {total} institutions to scrape (workers={workers})")
+    print(f"Scraper: {total} institutions to scrape (workers={workers}, tavily_batch={use_tavily_batch})")
+
+    # ── Tavily batch pass (optional, fast) ───────────────────────────────────
+    if use_tavily_batch and total > 0:
+        try:
+            from tavily_scraper import TAVILY_API_KEY
+            if TAVILY_API_KEY:
+                batch_ids = run_scraper_tavily_batch(rows, force=force)
+                # Remove already-scraped rows from the fallback queue
+                batch_id_set = set(batch_ids)
+                rows = [r for r in rows if r['id'] not in batch_id_set]
+                print(f"  Tavily batch done: {len(batch_ids)} scraped, {len(rows)} remain for fallback\n")
+        except ImportError:
+            pass  # tavily_scraper not available, proceed with original flow
 
     ok = errors = no_rates = 0
     scraped_ids = []
