@@ -90,15 +90,48 @@ def playwright_fetch(url, wait_ms=4000):
         return None
 
 
-def fetch_with_fallback(url):
-    """Try Jina first; if no rate content found, try Playwright."""
+def fetch_with_fallback(url, name=None, ptype=None, conn=None, inst_id=None):
+    """
+    Fetch strategy:
+    1. Jina (fast, ~1s) — if rates found, done
+    2. If Jina returns nav-only content → URL is likely wrong:
+       use Brave to find a better URL, save it, retry Jina on new URL
+    3. If still no rates → Playwright (full JS rendering, ~6-8s)
+    4. If still nothing → no_rates
+    """
+    # Step 1: Try Jina on the given URL
     text = jina_fetch(url)
     if text and has_rates(text):
         return text, 'jina'
-    # Playwright fallback
+
+    # Step 2: Jina returned content but no rates — URL might be a nav/marketing page
+    # Use Brave to find the actual rate page URL
+    if name and ptype:
+        query = f'{name} {"auto loan" if ptype == "loan" else "mortgage"} rates'
+        hits = brave_search(query, count=5)
+        for h in hits:
+            candidate = h.get('url', '')
+            # Only consider URLs from the same domain
+            original_domain = re.sub(r'^https?://(www\.)?', '', url).split('/')[0]
+            candidate_domain = re.sub(r'^https?://(www\.)?', '', candidate).split('/')[0]
+            if original_domain and original_domain in candidate_domain:
+                if any(k in candidate.lower() for k in ['rate', 'loan', 'mortgage', 'borrow']):
+                    if candidate != url:
+                        # Found a better URL — save it and retry
+                        if conn and inst_id:
+                            col = 'loan_rates_url' if ptype == 'loan' else 'mortgage_rates_url'
+                            conn.execute(f'UPDATE institutions SET {col}=? WHERE id=?', (candidate, inst_id))
+                            conn.commit()
+                        text2 = jina_fetch(candidate)
+                        if text2 and has_rates(text2):
+                            return text2, f'jina+brave({candidate})'
+                        break  # found a candidate but still no rates, fall through to Playwright
+
+    # Step 3: Playwright — handles JS-rendered rate widgets
     text = playwright_fetch(url)
     if text and has_rates(text):
         return text, 'playwright'
+
     return text, 'no_rates'
 
 
@@ -268,7 +301,7 @@ def process_institution(conn, inst):
 
     # Scrape + parse loans
     if not ex_loan and loan_url:
-        raw, method = fetch_with_fallback(loan_url)
+        raw, method = fetch_with_fallback(loan_url, name=name, ptype='loan', conn=conn, inst_id=inst_id)
         if raw and method != 'no_rates':
             conn.execute('UPDATE institutions SET loan_raw_section=?, loan_scrape_status=? WHERE id=?',
                         (raw[:25000], 'ok', inst_id))
@@ -290,7 +323,7 @@ def process_institution(conn, inst):
             raw = raw_src[0] if raw_src else None
             method = 'cached'
         else:
-            raw, method = fetch_with_fallback(mtg_url)
+            raw, method = fetch_with_fallback(mtg_url, name=name, ptype='mortgage', conn=conn, inst_id=inst_id)
 
         if raw and method != 'no_rates':
             conn.execute('UPDATE institutions SET mortgage_raw_section=?, mortgage_scrape_status=? WHERE id=?',
