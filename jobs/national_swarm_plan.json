@@ -1,0 +1,19 @@
+{
+  "total_institutions": 8597,
+  "workers": 12,
+  "chunk_size": 720,
+  "worker_assignments": [
+    {"worker_id": 1,  "type": "cu",   "offset": 0,    "limit": 720},
+    {"worker_id": 2,  "type": "cu",   "offset": 720,  "limit": 720},
+    {"worker_id": 3,  "type": "cu",   "offset": 1440, "limit": 720},
+    {"worker_id": 4,  "type": "cu",   "offset": 2160, "limit": 720},
+    {"worker_id": 5,  "type": "cu",   "offset": 2880, "limit": 720},
+    {"worker_id": 6,  "type": "cu",   "offset": 3600, "limit": 720},
+    {"worker_id": 7,  "type": "bank", "offset": 0,    "limit": 720},
+    {"worker_id": 8,  "type": "bank", "offset": 720,  "limit": 720},
+    {"worker_id": 9,  "type": "bank", "offset": 1440, "limit": 720},
+    {"worker_id": 10, "type": "bank", "offset": 2160, "limit": 720},
+    {"worker_id": 11, "type": "bank", "offset": 2880, "limit": 720},
+    {"worker_id": 12, "type": "bank", "offset": 3600, "limit": 720}
+  ]
+}
