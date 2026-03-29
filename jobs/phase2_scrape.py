@@ -83,21 +83,17 @@ def scrape(url, use_playwright=True):
     return text, 'no_rates'
 
 
-def gpt_extract(content, ptype, name):
-    import openai
-    client = openai.OpenAI(api_key=OPENAI_KEY)
-    if ptype == 'loan':
-        prompt = f"""Extract loan rates for {name}. Return JSON array, each item:
+PROMPT_LOAN = """Extract loan rates for {name}. Return JSON array, each item:
 - product: new_auto_loan | used_auto_loan | personal_loan | home_equity_loan
 - term_months: integer or null
 - rate: PERCENTAGE float (e.g. 4.74) or null if only APR shown
 - apr: PERCENTAGE float if shown separately, null if not. APR-only: set apr=val, rate=null.
-- loan_term_label: string or null
+- loan_term_label: string like "36 months" or null
 - notes: brief note
 Use lowest rate for ranges. Return [] if none found.
-Content: {content[:7000]}"""
-    else:
-        prompt = f"""Extract mortgage rates for {name}. Return JSON array, each item:
+Content: {content}"""
+
+PROMPT_MORTGAGE = """Extract mortgage rates for {name}. Return JSON array, each item:
 - product: mortgage_fixed | mortgage_arm
 - term_months: integer (360=30yr,240=20yr,180=15yr,120=10yr) or null for ARM
 - arm_initial_years: integer or null
@@ -107,19 +103,145 @@ Content: {content[:7000]}"""
 - conforming: 1=conforming, 0=jumbo, null=unclear
 - notes: brief note
 Return [] if none found.
-Content: {content[:7000]}"""
+Content: {content}"""
+
+PROMPT_DEPOSIT = """Extract deposit rates for {name}. Return JSON array, each item:
+- product: cd | savings | money_market | checking | ira_cd
+- term_months: integer for CDs (e.g. 12,24,36,48,60) or null for liquid
+- apy: PERCENTAGE float (e.g. 4.50 for 4.50%) or null if only APY not shown
+- min_balance: integer in dollars (e.g. 1000) or null
+- notes: brief note (e.g. "12mo CD", "high-yield savings", "promotional rate")
+Use highest APY for ranges. Return [] if none found.
+Content: {content}"""
+
+PROMPTS = {'loan': PROMPT_LOAN, 'mortgage': PROMPT_MORTGAGE, 'deposit': PROMPT_DEPOSIT}
+
+MODEL_FAST   = 'gpt-4o-mini'
+MODEL_STRONG = 'gpt-4o'
+
+
+def score_extraction(items, ptype, raw_text):
+    """
+    Score the quality of extracted rates 0-100.
+    Low score → escalate to stronger model.
+
+    Signals:
+    - Number of items extracted (more = better up to a point)
+    - Rate values are in plausible range
+    - No suspiciously round numbers (3.0, 5.0 only) — suggests hallucination
+    - Rate count matches % count in source text (catch under-extraction)
+    - All required fields populated
+    """
+    if not items:
+        return 0  # nothing extracted
+
+    score = 0
+    n = len(items)
+
+    # Count % signs in source as proxy for expected rate rows
+    pct_count = len([l for l in raw_text.split('\n')
+                     if '%' in l and any(c.isdigit() for c in l) and len(l) < 200])
+
+    # Reward extraction yield relative to source richness
+    if pct_count > 0:
+        yield_ratio = min(n / pct_count, 1.5)
+        score += int(yield_ratio * 30)  # up to 30 pts
+    else:
+        score += min(n * 5, 20)
+
+    # Rate value plausibility
+    valid_rates = 0
+    round_only  = True
+    for item in items:
+        rate = item.get('rate') or item.get('apr') or item.get('apy')
+        if rate is not None:
+            try:
+                f = float(rate)
+                if ptype in ('loan', 'mortgage'):
+                    if 1.0 <= f <= 30.0:
+                        valid_rates += 1
+                    if f % 1.0 != 0:  # has decimal → not purely round
+                        round_only = False
+                elif ptype == 'deposit':
+                    if 0.01 <= f <= 15.0:
+                        valid_rates += 1
+                    if f % 1.0 != 0:
+                        round_only = False
+            except:
+                pass
+
+    if n > 0:
+        score += int((valid_rates / n) * 35)  # up to 35 pts for valid values
+
+    # Penalty for all-round numbers (3.0, 5.0 etc.) — suggests hallucination
+    if round_only and n > 2:
+        score -= 20
+
+    # Field completeness
+    required = {
+        'loan':     ['product', 'term_months'],
+        'mortgage': ['product', 'term_months'],
+        'deposit':  ['product', 'apy'],
+    }.get(ptype, [])
+    complete = sum(1 for item in items
+                   if all(item.get(f) is not None for f in required))
+    if n > 0:
+        score += int((complete / n) * 20)  # up to 20 pts
+
+    # Variety bonus — multiple products/terms extracted
+    if ptype == 'deposit':
+        products = {item.get('product') for item in items}
+        score += min(len(products) * 3, 10)
+    else:
+        terms = {item.get('term_months') for item in items if item.get('term_months')}
+        score += min(len(terms) * 3, 10)
+
+    return max(0, min(score, 100))
+
+
+def _call_gpt(client, model, prompt):
+    """Raw GPT call, returns list or []."""
     try:
         resp = client.chat.completions.create(
-            model='gpt-4o-mini',
+            model=model,
             messages=[{'role': 'user', 'content': prompt}],
             response_format={'type': 'json_object'},
             temperature=0)
         raw = json.loads(resp.choices[0].message.content)
         if isinstance(raw, list): return raw
-        for k in ['rates','data','results','items','loans','mortgages']:
+        for k in ['rates','data','results','items','loans','mortgages',
+                  'deposits','cds','savings']:
             if k in raw and isinstance(raw[k], list): return raw[k]
         return []
     except: return []
+
+
+def gpt_extract(content, ptype, name, escalate_threshold=55):
+    """
+    Two-pass extraction:
+    1. gpt-4o-mini (fast, cheap)
+    2. If quality score < escalate_threshold → escalate to gpt-4o (strong)
+    Returns (items, model_used, quality_score)
+    """
+    import openai
+    client  = openai.OpenAI(api_key=OPENAI_KEY)
+    prompt  = PROMPTS[ptype].format(name=name, content=content[:7000])
+
+    # Pass 1: mini
+    items = _call_gpt(client, MODEL_FAST, prompt)
+    score = score_extraction(items, ptype, content)
+
+    if score >= escalate_threshold:
+        return items, MODEL_FAST, score
+
+    # Pass 2: escalate to gpt-4o
+    items2 = _call_gpt(client, MODEL_STRONG, prompt)
+    score2 = score_extraction(items2, ptype, content)
+
+    # Take whichever scored better
+    if score2 >= score:
+        return items2, MODEL_STRONG, score2
+    return items, MODEL_FAST, score
 
 
 def normalize(v):
@@ -239,10 +361,11 @@ def main():
                 conn.execute('UPDATE institutions SET loan_raw_section=?, loan_scrape_status=? WHERE id=?',
                             (raw[:25000], 'ok', inst_id))
                 conn.commit()
-                extracted = gpt_extract(raw, 'loan', name)
+                extracted, model_used, quality = gpt_extract(raw, 'loan', name)
                 n = insert_rates(conn, inst_id, extracted, 'loan')
                 total_loan += n
-                if n: print(f'  LOAN {name}: {n} ({method})')
+                escalated = '⬆' if model_used == MODEL_STRONG else ''
+                if n: print(f'  LOAN {name}: {n} rates | q={quality} {escalated} ({method}/{model_used})', flush=True)
             else:
                 conn.execute('UPDATE institutions SET loan_scrape_status=? WHERE id=?', ('no_rates', inst_id))
                 conn.commit()
@@ -263,10 +386,11 @@ def main():
                 conn.execute('UPDATE institutions SET mortgage_raw_section=?, mortgage_scrape_status=? WHERE id=?',
                             (raw[:25000], 'ok', inst_id))
                 conn.commit()
-                extracted = gpt_extract(raw, 'mortgage', name)
+                extracted, model_used, quality = gpt_extract(raw, 'mortgage', name)
                 n = insert_rates(conn, inst_id, extracted, 'mortgage')
                 total_mtg += n
-                if n: print(f'  MTG  {name}: {n} ({method})')
+                escalated = '⬆' if model_used == MODEL_STRONG else ''
+                if n: print(f'  MTG  {name}: {n} rates | q={quality} {escalated} ({method}/{model_used})', flush=True)
             elif raw is None:
                 conn.execute('UPDATE institutions SET mortgage_scrape_status=? WHERE id=?', ('no_rates', inst_id))
                 conn.commit()
