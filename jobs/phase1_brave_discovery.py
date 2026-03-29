@@ -34,6 +34,15 @@ SKIP_KEYWORDS = [
     'federal reserve', 'bankers bank', 'industrial loan', 'investment bank',
 ]
 
+# ── Deposit (CD/savings) rate path signals ────────────────────────────────────
+DEPOSIT_RATE_PATH = [
+    'deposit-rate', 'deposit_rate', 'savings-rate', 'cd-rate', 'certificate-rate',
+    'rates/savings', 'rates/cd', 'rates/deposit', 'rates/certificate',
+    'interest-rate', 'current-rate', 'rate-center', 'rate-table',
+    'rates.asp', 'rates.htm', 'rates.php', 'apy', 'dividend-rate',
+]
+DEPOSIT_SOFT = ['rate', 'rates', 'savings', 'deposit', 'cd', 'certificate', 'apy', 'yield']
+
 # ── Scoring signals ───────────────────────────────────────────────────────────
 
 # Strong positive: URL path clearly indicates a rate table/page
@@ -77,8 +86,15 @@ def score_url(url, title, snippet, domain, ptype):
         score -= 10  # off-domain hits are lower priority
 
     # URL path signals
-    rate_paths = LOAN_RATE_PATH if ptype == 'loan' else MTG_RATE_PATH
-    rate_soft  = LOAN_SOFT if ptype == 'loan' else MTG_SOFT
+    if ptype == 'loan':
+        rate_paths = LOAN_RATE_PATH
+        rate_soft  = LOAN_SOFT
+    elif ptype == 'mortgage':
+        rate_paths = MTG_RATE_PATH
+        rate_soft  = MTG_SOFT
+    else:  # deposit
+        rate_paths = DEPOSIT_RATE_PATH
+        rate_soft  = DEPOSIT_SOFT
 
     if any(k in u for k in rate_paths):
         score += 30
@@ -88,9 +104,10 @@ def score_url(url, title, snippet, domain, ptype):
     # Title/snippet has actual rate numbers (strong signal it's a rate page)
     if re.search(r'\d+\.\d+\s*%', ts):
         score += 25
-    if 'apr' in ts:
+    if 'apr' in ts or 'apy' in ts:
         score += 10
-    if any(w in ts for w in ['current rate', 'today\'s rate', 'as low as', 'starting at']):
+    if any(w in ts for w in ['current rate', "today's rate", 'as low as', 'starting at',
+                              'as high as', 'up to', 'earn up']):
         score += 8
 
     # Title suggests it's a rate page specifically
@@ -146,7 +163,7 @@ def find_best_url(name, domain, ptype, inst_type):
                 f'site:{domain} auto loan rates',
                 f'{name} car loan interest rates APR',
             ]
-    else:  # mortgage
+    elif ptype == 'mortgage':
         if inst_type == 'cu':
             queries = [
                 f'{name} credit union mortgage rates',
@@ -158,6 +175,19 @@ def find_best_url(name, domain, ptype, inst_type):
                 f'{name} mortgage rates today',
                 f'site:{domain} mortgage rates',
                 f'{name} home loan interest rates APR',
+            ]
+    else:  # deposit
+        if inst_type == 'cu':
+            queries = [
+                f'{name} credit union savings rates CD rates APY',
+                f'site:{domain} savings rates',
+                f'{name} certificate of deposit rates APY',
+            ]
+        else:
+            queries = [
+                f'{name} bank savings rates CD rates APY',
+                f'site:{domain} CD rates savings rates',
+                f'{name} certificate deposit interest rates APY',
             ]
 
     all_hits = []
@@ -218,20 +248,25 @@ def main():
     if args.type == 'cu':    type_filter = "AND type='cu'"
     elif args.type == 'bank': type_filter = "AND type='bank'"
 
-    url_filter = '' if args.reset else 'AND (loan_rates_url IS NULL OR mortgage_rates_url IS NULL)'
+    url_filter = '' if args.reset else \
+        'AND (loan_rates_url IS NULL OR mortgage_rates_url IS NULL OR rates_url IS NULL)'
 
     institutions = conn.execute(f"""
-        SELECT id, name, type, website_url, loan_rates_url, mortgage_rates_url
+        SELECT id, name, type, website_url, rates_url, loan_rates_url, mortgage_rates_url
         FROM institutions
         WHERE active=1 {type_filter} {url_filter}
         ORDER BY name
         LIMIT {args.limit}
     """).fetchall()
 
-    print(f"[Phase 1] Smart Brave discovery — {len(institutions)} institutions")
-    print(f"  Type: {args.type} | Reset: {args.reset} | Min score: {args.min_score}")
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    print(f"[Phase 1] Smart Brave discovery — {len(institutions)} institutions", flush=True)
+    print(f"  Type: {args.type} | Reset: {args.reset} | Min score: {args.min_score}", flush=True)
+    print(f"  Discovering: deposit (rates_url) + loan + mortgage URLs", flush=True)
 
-    loan_found = mtg_found = loan_skipped = mtg_skipped = skipped = 0
+    dep_found = loan_found = mtg_found = 0
+    dep_skipped = loan_skipped = mtg_skipped = skipped = 0
 
     for i, inst in enumerate(institutions):
         name      = inst['name']
@@ -239,22 +274,32 @@ def main():
 
         if any(k in name.lower() for k in SKIP_KEYWORDS):
             skipped += 1
-            conn.execute('UPDATE institutions SET last_scraped_at=NULL WHERE id=?', (inst['id'],))
             continue
 
         website = inst['website_url'] or ''
         domain  = re.sub(r'^https?://(www\.)?', '', website).split('/')[0]
 
+        # ── Deposit URL (CD/savings rates) ────────────────────────────────────
+        if not inst['rates_url'] or args.reset:
+            url, score = find_best_url(name, domain, 'deposit', inst_type)
+            if url and score >= args.min_score:
+                conn.execute('UPDATE institutions SET rates_url=? WHERE id=?', (url, inst['id']))
+                conn.commit()
+                dep_found += 1
+                if score >= 60:
+                    print(f'  DEP  ✅ {name}: {url} (score={score})', flush=True)
+            else:
+                dep_skipped += 1
+
         # ── Loan URL ──────────────────────────────────────────────────────────
         if not inst['loan_rates_url'] or args.reset:
             url, score = find_best_url(name, domain, 'loan', inst_type)
             if url and score >= args.min_score:
-                conn.execute('UPDATE institutions SET loan_rates_url=? WHERE id=?',
-                            (url, inst['id']))
+                conn.execute('UPDATE institutions SET loan_rates_url=? WHERE id=?', (url, inst['id']))
                 conn.commit()
                 loan_found += 1
                 if score >= 60:
-                    print(f'  LOAN ✅ {name}: {url} (score={score})')
+                    print(f'  LOAN ✅ {name}: {url} (score={score})', flush=True)
             else:
                 loan_skipped += 1
 
@@ -262,30 +307,32 @@ def main():
         if not inst['mortgage_rates_url'] or args.reset:
             url, score = find_best_url(name, domain, 'mortgage', inst_type)
             if url and score >= args.min_score:
-                conn.execute('UPDATE institutions SET mortgage_rates_url=? WHERE id=?',
-                            (url, inst['id']))
+                conn.execute('UPDATE institutions SET mortgage_rates_url=? WHERE id=?', (url, inst['id']))
                 conn.commit()
                 mtg_found += 1
                 if score >= 60:
-                    print(f'  MTG  ✅ {name}: {url} (score={score})')
+                    print(f'  MTG  ✅ {name}: {url} (score={score})', flush=True)
             else:
                 mtg_skipped += 1
 
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 25 == 0:
             pct = (i+1) / len(institutions) * 100
             print(f'  [{i+1}/{len(institutions)} {pct:.0f}%] '
-                  f'loan_found={loan_found} mtg_found={mtg_found}')
+                  f'dep={dep_found} loan={loan_found} mtg={mtg_found}', flush=True)
 
     print(f'\n[Phase 1 DONE]')
-    print(f'  Loan URLs found: {loan_found} | skipped (low score): {loan_skipped}')
-    print(f'  Mtg  URLs found: {mtg_found} | skipped (low score): {mtg_skipped}')
-    print(f'  Skipped (private banking): {skipped}')
+    print(f'  Deposit URLs found: {dep_found} | low-score: {dep_skipped}')
+    print(f'  Loan    URLs found: {loan_found} | low-score: {loan_skipped}')
+    print(f'  Mtg     URLs found: {mtg_found} | low-score: {mtg_skipped}')
+    print(f'  Skipped (private/non-retail): {skipped}')
 
+    total    = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1').fetchone()[0]
+    has_dep  = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1 AND rates_url IS NOT NULL').fetchone()[0]
     has_loan = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1 AND loan_rates_url IS NOT NULL').fetchone()[0]
     has_mtg  = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1 AND mortgage_rates_url IS NOT NULL').fetchone()[0]
-    total    = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1').fetchone()[0]
-    print(f'  Total with loan URL: {has_loan:,}/{total:,} ({has_loan/total*100:.1f}%)')
-    print(f'  Total with mtg URL:  {has_mtg:,}/{total:,} ({has_mtg/total*100:.1f}%)')
+    print(f'\n  Total with deposit URL: {has_dep:,}/{total:,} ({has_dep/total*100:.1f}%)')
+    print(f'  Total with loan URL:    {has_loan:,}/{total:,} ({has_loan/total*100:.1f}%)')
+    print(f'  Total with mtg URL:     {has_mtg:,}/{total:,} ({has_mtg/total*100:.1f}%)')
     conn.close()
 
 
