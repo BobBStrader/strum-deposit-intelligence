@@ -90,42 +90,84 @@ def playwright_fetch(url, wait_ms=4000):
         return None
 
 
-def fetch_with_fallback(url, name=None, ptype=None, conn=None, inst_id=None):
+def url_is_alive(url):
+    """Quick HEAD check — returns (alive, status_code)."""
+    try:
+        r = requests.get(f'https://r.jina.ai/{url}', headers={'Accept': 'text/plain'}, timeout=6)
+        return r.status_code == 200 and len(r.text) > 200, r.status_code
+    except:
+        return False, 0
+
+
+def rediscover_url(inst_id, name, domain, ptype, deposit_url, inst_type, conn):
+    """URL gone stale — find the new one via Phase 1 discovery logic."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+        from phase1_brave_discovery import find_best_url
+        url, score = find_best_url(name, domain, ptype, inst_type, deposit_url=deposit_url)
+        if url and score >= 30:
+            col = {'loan': 'loan_rates_url', 'mortgage': 'mortgage_rates_url',
+                   'deposit': 'rates_url'}.get(ptype, 'rates_url')
+            conn.execute(f'UPDATE institutions SET {col}=? WHERE id=?', (url, inst_id))
+            conn.commit()
+            print(f'    ✅ Rediscovered {ptype} URL for {name}: {url} (score={score})')
+            return url, score
+    except Exception as e:
+        pass
+    return None, 0
+
+
+def fetch_with_fallback(url, name=None, ptype=None, conn=None, inst_id=None,
+                        inst_type=None, deposit_url=None, domain=None):
     """
     Fetch strategy:
     1. Jina (fast, ~1s) — if rates found, done
-    2. If Jina returns nav-only content → URL is likely wrong:
-       use Brave to find a better URL, save it, retry Jina on new URL
-    3. If still no rates → Playwright (full JS rendering, ~6-8s)
-    4. If still nothing → no_rates
+    2. If Jina returns nav-only/empty → check if URL is dead:
+       - If dead: re-discover URL via Brave, retry on new URL
+       - If alive but no rates: try Playwright
+    3. Playwright (full JS rendering, ~6-8s)
+    4. no_rates
     """
     # Step 1: Try Jina on the given URL
     text = jina_fetch(url)
     if text and has_rates(text):
         return text, 'jina'
 
-    # Step 2: Jina returned content but no rates — URL might be a nav/marketing page
-    # Use Brave to find the actual rate page URL
-    if name and ptype:
-        query = f'{name} {"auto loan" if ptype == "loan" else "mortgage"} rates'
-        hits = brave_search(query, count=5)
-        for h in hits:
-            candidate = h.get('url', '')
-            # Only consider URLs from the same domain
-            original_domain = re.sub(r'^https?://(www\.)?', '', url).split('/')[0]
-            candidate_domain = re.sub(r'^https?://(www\.)?', '', candidate).split('/')[0]
-            if original_domain and original_domain in candidate_domain:
-                if any(k in candidate.lower() for k in ['rate', 'loan', 'mortgage', 'borrow']):
-                    if candidate != url:
-                        # Found a better URL — save it and retry
-                        if conn and inst_id:
-                            col = 'loan_rates_url' if ptype == 'loan' else 'mortgage_rates_url'
-                            conn.execute(f'UPDATE institutions SET {col}=? WHERE id=?', (candidate, inst_id))
-                            conn.commit()
-                        text2 = jina_fetch(candidate)
-                        if text2 and has_rates(text2):
-                            return text2, f'jina+brave({candidate})'
-                        break  # found a candidate but still no rates, fall through to Playwright
+    # Step 2: No rates — check if URL is dead or just JS-rendered
+    alive, status = url_is_alive(url)
+
+    if not alive or status in (404, 410, 0):
+        # URL is dead — trigger re-discovery
+        print(f'    ⚠ URL dead ({status}): {url}')
+        if inst_id and name and ptype and domain:
+            new_url, score = rediscover_url(inst_id, name, domain, ptype,
+                                            deposit_url, inst_type or 'cu', conn)
+            if new_url and new_url != url:
+                text2 = jina_fetch(new_url)
+                if text2 and has_rates(text2):
+                    return text2, f'jina+rediscovered'
+                # Try Playwright on new URL
+                text3 = playwright_fetch(new_url)
+                if text3 and has_rates(text3):
+                    return text3, f'playwright+rediscovered'
+    else:
+        # URL alive but no rates — might be JS-rendered or wrong page
+        # Try Brave for a better URL first (cheaper than Playwright)
+        if name and ptype and domain:
+            from phase1_brave_discovery import find_best_url
+            try:
+                new_url, score = find_best_url(name, domain, ptype,
+                                               inst_type or 'cu', deposit_url=deposit_url)
+                if new_url and new_url != url and score >= 40:
+                    if conn and inst_id:
+                        col = 'loan_rates_url' if ptype == 'loan' else 'mortgage_rates_url'
+                        conn.execute(f'UPDATE institutions SET {col}=? WHERE id=?', (new_url, inst_id))
+                        conn.commit()
+                    text2 = jina_fetch(new_url)
+                    if text2 and has_rates(text2):
+                        return text2, f'jina+brave'
+            except:
+                pass
 
     # Step 3: Playwright — handles JS-rendered rate widgets
     text = playwright_fetch(url)

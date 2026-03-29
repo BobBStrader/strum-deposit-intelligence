@@ -4,6 +4,9 @@ Phase 2: Scrape + Parse
 For all institutions with URLs, scrape with Jina (fast) then Playwright (JS fallback),
 then GPT-parse and insert rates.
 
+If a URL returns no rates (404, redirect, or empty content), triggers automatic
+URL re-discovery via Phase 1 logic before giving up.
+
 Run after phase1_brave_discovery.py.
 
 Usage:
@@ -11,6 +14,8 @@ Usage:
     python3 jobs/phase2_scrape.py --type cu
     python3 jobs/phase2_scrape.py --limit 1000
     python3 jobs/phase2_scrape.py --playwright-only   # only retry no_rates with Playwright
+    python3 jobs/phase2_scrape.py --check-stale       # re-scrape existing rates, fix broken URLs
+    python3 jobs/phase2_scrape.py --stale-days 90     # consider URLs stale after N days (default 90)
     python3 jobs/phase2_scrape.py --stats
 """
 
@@ -71,6 +76,47 @@ def has_rates(text):
     return len(lines) >= 2
 
 
+def url_is_alive(url):
+    """Quick HEAD check — returns (alive, status_code, final_url)."""
+    try:
+        r = requests.head(url, timeout=8, allow_redirects=True,
+                         headers={'User-Agent': UA})
+        final = r.url
+        # Consider alive if 200 and not redirected to a completely different domain
+        orig_domain = re.sub(r'^https?://(www\.)?', '', url).split('/')[0]
+        final_domain = re.sub(r'^https?://(www\.)?', '', final).split('/')[0]
+        same_domain = orig_domain.lower() in final_domain.lower()
+        return r.status_code == 200 and same_domain, r.status_code, final
+    except:
+        return False, 0, url
+
+
+def rediscover_url(inst_id, name, domain, ptype, deposit_url, inst_type, conn):
+    """
+    A known URL has gone stale (404, redirect off-domain, or no rates).
+    Try to find the new URL using:
+    1. Deposit URL derivation (if we have a deposit URL)
+    2. Brave search with updated queries
+    3. Path probing on the domain
+    Returns (new_url, score) or (None, 0).
+    """
+    # Import Phase 1 discovery logic
+    sys.path.insert(0, os.path.dirname(__file__))
+    try:
+        from phase1_brave_discovery import find_best_url
+        url, score = find_best_url(name, domain, ptype, inst_type, deposit_url=deposit_url)
+        if url and score >= 30:
+            # Save the new URL
+            col = {'loan': 'loan_rates_url', 'mortgage': 'mortgage_rates_url',
+                   'deposit': 'rates_url'}.get(ptype, 'rates_url')
+            conn.execute(f'UPDATE institutions SET {col}=? WHERE id=?', (url, inst_id))
+            conn.commit()
+            return url, score
+    except Exception as e:
+        pass
+    return None, 0
+
+
 def scrape(url, use_playwright=True):
     """Jina first, Playwright fallback if no rates found."""
     text = jina_fetch(url)
@@ -81,6 +127,38 @@ def scrape(url, use_playwright=True):
         if text2 and has_rates(text2):
             return text2, 'playwright'
     return text, 'no_rates'
+
+
+def scrape_with_stale_detection(url, inst_id, name, domain, ptype, inst_type,
+                                 deposit_url, conn, use_playwright=True):
+    """
+    Scrape a URL. If it returns no rates:
+    1. Check if the URL is still alive (HEAD request)
+    2. If dead/redirected: trigger URL re-discovery, retry on new URL
+    3. If alive but no rates: try Playwright, then give up
+    Returns (text, method, final_url_used).
+    """
+    # First attempt
+    text, method = scrape(url, use_playwright) if use_playwright else (jina_fetch(url), 'jina')
+    if method not in ('no_rates',) and text and has_rates(text):
+        return text, method, url
+
+    # No rates — check if URL is still valid
+    alive, status, final_url = url_is_alive(url)
+
+    if not alive or status in (404, 410, 301, 302):
+        # URL is dead or redirected off-domain — find the new one
+        print(f'    ⚠ Stale URL ({status}): {url}', flush=True)
+        new_url, score = rediscover_url(inst_id, name, domain, ptype, deposit_url, inst_type, conn)
+        if new_url and new_url != url:
+            print(f'    ✅ New URL found (score={score}): {new_url}', flush=True)
+            text2, method2 = scrape(new_url, use_playwright)
+            if text2 and has_rates(text2):
+                return text2, f'{method2}+rediscovered', new_url
+        return text, 'stale_url', url
+
+    # URL alive but no rates — Playwright already tried, give up
+    return text, 'no_rates', url
 
 
 PROMPT_LOAN = """Extract loan rates for {name}. Return JSON array, each item:
@@ -299,6 +377,10 @@ def main():
     parser.add_argument('--limit',           type=int, default=99999)
     parser.add_argument('--playwright-only', action='store_true',
                         help='Only re-run institutions marked no_rates, using Playwright only')
+    parser.add_argument('--check-stale',     action='store_true',
+                        help='Re-scrape institutions with existing rates to find broken URLs')
+    parser.add_argument('--stale-days',      type=int, default=90,
+                        help='Re-scrape institutions not scraped in N days (default: 90)')
     parser.add_argument('--stats',           action='store_true')
     args = parser.parse_args()
 
@@ -311,36 +393,53 @@ def main():
     if args.type == 'cu':   type_filter = "AND i.type='cu'"
     elif args.type == 'bank': type_filter = "AND i.type='bank'"
 
-    if args.playwright_only:
-        # Retry confirmed no_rates institutions with Playwright only
-        where = f"WHERE active=1 AND (loan_scrape_status='no_rates' OR mortgage_scrape_status='no_rates') {type_filter}"
+    stale_cutoff = (datetime.datetime.now() - datetime.timedelta(days=args.stale_days)).isoformat()
+
+    if args.check_stale:
+        # Re-check institutions whose rates are old — find broken URLs
+        where = f"""WHERE i.active=1
+            AND i.last_scraped_at < '{stale_cutoff}'
+            AND (i.loan_rates_url IS NOT NULL OR i.mortgage_rates_url IS NOT NULL)
+            {type_filter}"""
+    elif args.playwright_only:
+        where = f"WHERE i.active=1 AND (i.loan_scrape_status='no_rates' OR i.mortgage_scrape_status='no_rates') {type_filter}"
     else:
         # Normal: process institutions with URLs not yet scraped
-        where = f"WHERE active=1 AND last_scraped_at IS NULL AND (loan_rates_url IS NOT NULL OR mortgage_rates_url IS NOT NULL) {type_filter}"
+        where = f"WHERE i.active=1 AND i.last_scraped_at IS NULL AND (i.loan_rates_url IS NOT NULL OR i.mortgage_rates_url IS NOT NULL) {type_filter}"
 
     institutions = conn.execute(f"""
-        SELECT id, name, type, website_url, loan_rates_url, mortgage_rates_url,
-               loan_raw_section, mortgage_raw_section, loan_scrape_status, mortgage_scrape_status
+        SELECT i.id, i.name, i.type, i.website_url, i.rates_url,
+               i.loan_rates_url, i.mortgage_rates_url,
+               i.loan_raw_section, i.mortgage_raw_section,
+               i.loan_scrape_status, i.mortgage_scrape_status,
+               i.last_scraped_at
         FROM institutions i
         {where}
-        ORDER BY name
+        ORDER BY i.name
         LIMIT {args.limit}
     """).fetchall()
 
-    use_playwright = True  # always use playwright fallback in phase 2
+    use_playwright = True
 
     print(f"[Phase 2] Scraping {len(institutions)} institutions (playwright={'playwright-only' if args.playwright_only else 'fallback'})")
 
     total_loan = total_mtg = 0
 
     for i, inst in enumerate(institutions):
-        inst_id = inst['id']
-        name    = inst['name']
+        inst_id    = inst['id']
+        name       = inst['name']
+        inst_type  = inst['type']
+        website    = inst['website_url'] or ''
+        domain     = re.sub(r'^https?://(www\.)?', '', website).split('/')[0]
+        deposit_url = inst['rates_url']
 
         if any(k in name.lower() for k in SKIP_KEYWORDS):
             conn.execute('UPDATE institutions SET last_scraped_at=? WHERE id=?', (NOW, inst_id))
             conn.commit()
             continue
+
+        # In stale-check mode, always re-scrape regardless of existing rates
+        force = args.check_stale
 
         ex_loan = conn.execute("SELECT COUNT(*) FROM rates WHERE institution_id=? AND (product LIKE '%auto%' OR product='personal_loan')", (inst_id,)).fetchone()[0]
         ex_mtg  = conn.execute("SELECT COUNT(*) FROM rates WHERE institution_id=? AND product LIKE 'mortgage%'", (inst_id,)).fetchone()[0]
@@ -349,15 +448,16 @@ def main():
         mtg_url  = inst['mortgage_rates_url']
 
         # ── Loans ──────────────────────────────────────────────────────────────
-        if not ex_loan and loan_url:
+        if loan_url and (not ex_loan or force):
             if args.playwright_only:
-                raw, method = playwright_fetch(loan_url), 'playwright'
-                if not (raw and has_rates(raw)):
-                    raw, method = None, 'no_rates'
+                raw = playwright_fetch(loan_url)
+                method = 'playwright' if (raw and has_rates(raw)) else 'no_rates'
+                final_url = loan_url
             else:
-                raw, method = scrape(loan_url)
+                raw, method, final_url = scrape_with_stale_detection(
+                    loan_url, inst_id, name, domain, 'loan', inst_type, deposit_url, conn)
 
-            if raw and method != 'no_rates':
+            if raw and method not in ('no_rates', 'stale_url'):
                 conn.execute('UPDATE institutions SET loan_raw_section=?, loan_scrape_status=? WHERE id=?',
                             (raw[:25000], 'ok', inst_id))
                 conn.commit()
@@ -365,24 +465,26 @@ def main():
                 n = insert_rates(conn, inst_id, extracted, 'loan')
                 total_loan += n
                 escalated = '⬆' if model_used == MODEL_STRONG else ''
-                if n: print(f'  LOAN {name}: {n} rates | q={quality} {escalated} ({method}/{model_used})', flush=True)
+                if n: print(f'  LOAN {name}: {n} rates | q={quality}{escalated} ({method})', flush=True)
             else:
-                conn.execute('UPDATE institutions SET loan_scrape_status=? WHERE id=?', ('no_rates', inst_id))
+                status = 'stale_url' if method == 'stale_url' else 'no_rates'
+                conn.execute('UPDATE institutions SET loan_scrape_status=? WHERE id=?', (status, inst_id))
                 conn.commit()
 
         # ── Mortgages ──────────────────────────────────────────────────────────
-        if not ex_mtg and mtg_url:
+        if mtg_url and (not ex_mtg or force):
             if mtg_url == loan_url:
                 row = conn.execute('SELECT loan_raw_section FROM institutions WHERE id=?', (inst_id,)).fetchone()
-                raw, method = (row[0], 'cached') if row and row[0] else (None, 'no_raw')
+                raw, method, final_url = (row[0], 'cached', mtg_url) if row and row[0] else (None, 'no_raw', mtg_url)
             elif args.playwright_only:
-                raw, method = playwright_fetch(mtg_url), 'playwright'
-                if not (raw and has_rates(raw)):
-                    raw, method = None, 'no_rates'
+                raw = playwright_fetch(mtg_url)
+                method = 'playwright' if (raw and has_rates(raw)) else 'no_rates'
+                final_url = mtg_url
             else:
-                raw, method = scrape(mtg_url)
+                raw, method, final_url = scrape_with_stale_detection(
+                    mtg_url, inst_id, name, domain, 'mortgage', inst_type, deposit_url, conn)
 
-            if raw and method not in ('no_rates', 'no_raw'):
+            if raw and method not in ('no_rates', 'stale_url', 'no_raw'):
                 conn.execute('UPDATE institutions SET mortgage_raw_section=?, mortgage_scrape_status=? WHERE id=?',
                             (raw[:25000], 'ok', inst_id))
                 conn.commit()
@@ -390,9 +492,10 @@ def main():
                 n = insert_rates(conn, inst_id, extracted, 'mortgage')
                 total_mtg += n
                 escalated = '⬆' if model_used == MODEL_STRONG else ''
-                if n: print(f'  MTG  {name}: {n} rates | q={quality} {escalated} ({method}/{model_used})', flush=True)
-            elif raw is None:
-                conn.execute('UPDATE institutions SET mortgage_scrape_status=? WHERE id=?', ('no_rates', inst_id))
+                if n: print(f'  MTG  {name}: {n} rates | q={quality}{escalated} ({method})', flush=True)
+            elif raw is None or method in ('no_rates', 'stale_url'):
+                status = 'stale_url' if method == 'stale_url' else 'no_rates'
+                conn.execute('UPDATE institutions SET mortgage_scrape_status=? WHERE id=?', (status, inst_id))
                 conn.commit()
 
         conn.execute('UPDATE institutions SET last_scraped_at=? WHERE id=?', (NOW, inst_id))
