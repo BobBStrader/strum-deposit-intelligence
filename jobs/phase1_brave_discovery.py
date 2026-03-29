@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-Phase 1: Brave URL Discovery
-Find loan + mortgage rate page URLs for all institutions using Brave Search.
-Fast — no scraping, just URL discovery. ~2-3 hours for all 8,597 institutions.
+Phase 1: Smart Brave URL Discovery
+Finds the best loan + mortgage rate page URLs using scored URL ranking,
+multiple query variants, and title/snippet signals.
+
+Scoring logic:
+- Same domain as institution website: +40 pts (required to be preferred)
+- URL path contains rate-specific keywords: +30 pts
+- URL path suggests a rate TABLE (not calculator/apply): +20 pts
+- Title/snippet contains actual rate numbers (e.g. "4.99%"): +25 pts
+- Title/snippet contains "APR": +10 pts
+- URL is NOT a PDF (prefer HTML): +5 pts
+- URL contains NEGATIVE signals (apply, calculator, estimator): -20 pts
+- URL contains STRONG negatives (blog, news, about, contact): -40 pts
 
 Usage:
     python3 jobs/phase1_brave_discovery.py              # all institutions
     python3 jobs/phase1_brave_discovery.py --type cu    # CUs only
     python3 jobs/phase1_brave_discovery.py --type bank  # banks only
     python3 jobs/phase1_brave_discovery.py --reset      # redo already-discovered
+    python3 jobs/phase1_brave_discovery.py --limit 500  # first N institutions
 
-Run this first, then run phase2_jina_scrape.py + phase3_playwright_scrape.py
+Run this first, then run phase2_scrape.py
 """
 
-import argparse, sqlite3, json, time, datetime, re, requests, sys, os
+import argparse, sqlite3, json, time, re, requests, sys, os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'db', 'rates.db')
-
+DB_PATH   = os.path.join(os.path.dirname(__file__), '..', 'db', 'rates.db')
 BRAVE_KEY = 'BSAV_DCBYpxwTArxRNJG6T-jMyfh7U4'
 
 SKIP_KEYWORDS = [
@@ -24,16 +34,85 @@ SKIP_KEYWORDS = [
     'federal reserve', 'bankers bank', 'industrial loan', 'investment bank',
 ]
 
-# Keywords that suggest a URL is a rate page (not marketing/product page)
-RATE_URL_KEYWORDS = ['rate', 'rates', 'loan-rates', 'borrow', 'lending', 'apu', 'apr']
-MTG_URL_KEYWORDS  = ['rate', 'rates', 'mortgage-rates', 'home-loan', 'mortgage', 'refinance']
+# ── Scoring signals ───────────────────────────────────────────────────────────
+
+# Strong positive: URL path clearly indicates a rate table/page
+LOAN_RATE_PATH = [
+    'loan-rate', 'loan_rate', 'auto-rate', 'vehicle-rate', 'borrow/rate',
+    'lending-rate', 'rates/loan', 'rates/auto', 'rates/vehicle',
+    'interest-rate', 'current-rate', 'rate-center', 'rate-table',
+    'consumer-rate', 'personal-rate', 'rates.asp', 'rates.htm', 'rates.php',
+]
+MTG_RATE_PATH = [
+    'mortgage-rate', 'mortgage_rate', 'home-loan-rate', 'home_loan_rate',
+    'rates/mortgage', 'rates/home', 'rates/real-estate',
+    'current-mortgage', 'mortgage-interest', 'rate-center',
+    'mortgage.asp', 'mortgage.htm', 'rates.asp', 'rates.htm',
+]
+
+# Moderate positive: URL suggests the borrow/rates section
+LOAN_SOFT = ['rate', 'rates', 'borrow', 'lending', 'loan', 'vehicle', 'auto', 'personal']
+MTG_SOFT  = ['rate', 'rates', 'mortgage', 'home-loan', 'homeloans', 'refinance', 'heloc']
+
+# Negative: URL is a product page, not a rate table
+SOFT_NEG  = ['apply', 'calculator', 'estimat', 'get-started', 'prequalif', 'preapproval']
+HARD_NEG  = ['blog', 'news', 'about', 'contact', 'career', 'login', 'account',
+             'member', 'routing', 'branch', 'atm', 'location', 'event', 'press']
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.row_factory = sqlite3.Row
-    return conn
+def score_url(url, title, snippet, domain, ptype):
+    """Score a candidate URL 0-100. Higher = more likely to be a rate table page."""
+    score = 0
+    u   = url.lower()
+    t   = (title or '').lower()
+    s   = (snippet or '').lower()
+    ts  = t + ' ' + s
+    u_domain = re.sub(r'^https?://(www\.)?', '', url).split('/')[0].lower()
+
+    # Domain match (required for high scores)
+    same_domain = bool(domain) and domain.lower() in u_domain
+    if same_domain:
+        score += 40
+    else:
+        score -= 10  # off-domain hits are lower priority
+
+    # URL path signals
+    rate_paths = LOAN_RATE_PATH if ptype == 'loan' else MTG_RATE_PATH
+    rate_soft  = LOAN_SOFT if ptype == 'loan' else MTG_SOFT
+
+    if any(k in u for k in rate_paths):
+        score += 30
+    elif any(k in u for k in rate_soft):
+        score += 12
+
+    # Title/snippet has actual rate numbers (strong signal it's a rate page)
+    if re.search(r'\d+\.\d+\s*%', ts):
+        score += 25
+    if 'apr' in ts:
+        score += 10
+    if any(w in ts for w in ['current rate', 'today\'s rate', 'as low as', 'starting at']):
+        score += 8
+
+    # Title suggests it's a rate page specifically
+    if any(w in t for w in ['rate', 'rates', 'apr', 'apy']):
+        score += 8
+
+    # Negative signals
+    if any(k in u for k in SOFT_NEG):
+        score -= 20
+    if any(k in u for k in HARD_NEG):
+        score -= 40
+
+    # PDF penalty (prefer HTML for scraping)
+    if u.endswith('.pdf'):
+        score -= 10
+
+    # Bonus: short/clean path (rate pages tend to be top-level)
+    path_depth = len([p for p in u.replace('https://', '').split('/') if p]) - 1
+    if path_depth <= 2:
+        score += 5
+
+    return score
 
 
 def brave_search(query, count=5):
@@ -48,23 +127,79 @@ def brave_search(query, count=5):
         return []
 
 
-def best_url(hits, domain, keywords):
-    """Pick the best URL from Brave results — prefer same domain + rate keywords."""
-    # First pass: same domain + rate keyword in path
-    for h in hits:
-        u = h.get('url', '')
-        u_domain = re.sub(r'^https?://(www\.)?', '', u).split('/')[0]
-        if domain and domain in u_domain:
-            if any(k in u.lower() for k in keywords):
-                return u
-    # Second pass: same domain, any URL
-    for h in hits:
-        u = h.get('url', '')
-        u_domain = re.sub(r'^https?://(www\.)?', '', u).split('/')[0]
-        if domain and domain in u_domain:
-            return u
-    # Fallback: first result
-    return hits[0].get('url') if hits else None
+def find_best_url(name, domain, ptype, inst_type):
+    """
+    Run 2-3 Brave queries with different phrasings, score all results,
+    return the highest-scoring URL.
+    """
+    # Build query variants — different phrasings catch different sites
+    if ptype == 'loan':
+        if inst_type == 'cu':
+            queries = [
+                f'{name} credit union auto loan rates',
+                f'site:{domain} auto loan rates',
+                f'{name} vehicle loan rates APR',
+            ]
+        else:
+            queries = [
+                f'{name} auto loan rates',
+                f'site:{domain} auto loan rates',
+                f'{name} car loan interest rates APR',
+            ]
+    else:  # mortgage
+        if inst_type == 'cu':
+            queries = [
+                f'{name} credit union mortgage rates',
+                f'site:{domain} mortgage rates',
+                f'{name} home loan rates today APR',
+            ]
+        else:
+            queries = [
+                f'{name} mortgage rates today',
+                f'site:{domain} mortgage rates',
+                f'{name} home loan interest rates APR',
+            ]
+
+    all_hits = []
+    for q in queries:
+        hits = brave_search(q, count=5)
+        all_hits.extend(hits)
+        time.sleep(0.12)
+
+    if not all_hits:
+        return None, 0
+
+    # Score all hits and return the best
+    scored = []
+    for h in all_hits:
+        url     = h.get('url', '')
+        title   = h.get('title', '')
+        snippet = h.get('description', '')
+        if not url:
+            continue
+        s = score_url(url, title, snippet, domain, ptype)
+        scored.append((s, url, title))
+
+    # Deduplicate by URL, keep highest score
+    seen = {}
+    for score, url, title in scored:
+        if url not in seen or score > seen[url][0]:
+            seen[url] = (score, title)
+
+    ranked = sorted(seen.items(), key=lambda x: x[1][0], reverse=True)
+
+    if not ranked:
+        return None, 0
+
+    best_url, (best_score, best_title) = ranked[0]
+    return best_url, best_score
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def main():
@@ -73,17 +208,17 @@ def main():
     parser.add_argument('--limit', type=int, default=99999)
     parser.add_argument('--reset', action='store_true',
                         help='Re-discover URLs even if already set')
+    parser.add_argument('--min-score', type=int, default=30,
+                        help='Minimum score to accept a URL (default: 30)')
     args = parser.parse_args()
 
     conn = get_db()
 
     type_filter = ''
-    if args.type == 'cu':   type_filter = "AND type='cu'"
+    if args.type == 'cu':    type_filter = "AND type='cu'"
     elif args.type == 'bank': type_filter = "AND type='bank'"
 
-    url_filter = ''
-    if not args.reset:
-        url_filter = 'AND (loan_rates_url IS NULL OR mortgage_rates_url IS NULL)'
+    url_filter = '' if args.reset else 'AND (loan_rates_url IS NULL OR mortgage_rates_url IS NULL)'
 
     institutions = conn.execute(f"""
         SELECT id, name, type, website_url, loan_rates_url, mortgage_rates_url
@@ -93,16 +228,18 @@ def main():
         LIMIT {args.limit}
     """).fetchall()
 
-    print(f"[Phase 1] Brave URL discovery — {len(institutions)} institutions to process")
-    print(f"  Type: {args.type} | Reset: {args.reset}")
+    print(f"[Phase 1] Smart Brave discovery — {len(institutions)} institutions")
+    print(f"  Type: {args.type} | Reset: {args.reset} | Min score: {args.min_score}")
 
-    loan_found = mtg_found = skipped = 0
+    loan_found = mtg_found = loan_skipped = mtg_skipped = skipped = 0
 
     for i, inst in enumerate(institutions):
-        name = inst['name']
+        name      = inst['name']
+        inst_type = inst['type']
 
         if any(k in name.lower() for k in SKIP_KEYWORDS):
             skipped += 1
+            conn.execute('UPDATE institutions SET last_scraped_at=NULL WHERE id=?', (inst['id'],))
             continue
 
         website = inst['website_url'] or ''
@@ -110,37 +247,45 @@ def main():
 
         # ── Loan URL ──────────────────────────────────────────────────────────
         if not inst['loan_rates_url'] or args.reset:
-            hits = brave_search(f'{name} auto loan rates {domain}', count=5)
-            url = best_url(hits, domain, RATE_URL_KEYWORDS)
-            if url:
+            url, score = find_best_url(name, domain, 'loan', inst_type)
+            if url and score >= args.min_score:
                 conn.execute('UPDATE institutions SET loan_rates_url=? WHERE id=?',
                             (url, inst['id']))
                 conn.commit()
                 loan_found += 1
-            time.sleep(0.12)  # ~8 req/sec, well within paid tier
+                if score >= 60:
+                    print(f'  LOAN ✅ {name}: {url} (score={score})')
+            else:
+                loan_skipped += 1
 
         # ── Mortgage URL ──────────────────────────────────────────────────────
         if not inst['mortgage_rates_url'] or args.reset:
-            hits = brave_search(f'{name} mortgage rates {domain}', count=5)
-            url = best_url(hits, domain, MTG_URL_KEYWORDS)
-            if url:
+            url, score = find_best_url(name, domain, 'mortgage', inst_type)
+            if url and score >= args.min_score:
                 conn.execute('UPDATE institutions SET mortgage_rates_url=? WHERE id=?',
                             (url, inst['id']))
                 conn.commit()
                 mtg_found += 1
-            time.sleep(0.12)
+                if score >= 60:
+                    print(f'  MTG  ✅ {name}: {url} (score={score})')
+            else:
+                mtg_skipped += 1
 
-        if (i + 1) % 250 == 0:
-            print(f"  [{i+1}/{len(institutions)}] loan_urls={loan_found} mtg_urls={mtg_found}")
+        if (i + 1) % 100 == 0:
+            pct = (i+1) / len(institutions) * 100
+            print(f'  [{i+1}/{len(institutions)} {pct:.0f}%] '
+                  f'loan_found={loan_found} mtg_found={mtg_found}')
 
-    print(f"\n[Phase 1 DONE] loan_urls_found={loan_found} mtg_urls_found={mtg_found} skipped={skipped}")
+    print(f'\n[Phase 1 DONE]')
+    print(f'  Loan URLs found: {loan_found} | skipped (low score): {loan_skipped}')
+    print(f'  Mtg  URLs found: {mtg_found} | skipped (low score): {mtg_skipped}')
+    print(f'  Skipped (private banking): {skipped}')
 
-    # Summary
     has_loan = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1 AND loan_rates_url IS NOT NULL').fetchone()[0]
     has_mtg  = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1 AND mortgage_rates_url IS NOT NULL').fetchone()[0]
     total    = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1').fetchone()[0]
-    print(f"  Total with loan URL: {has_loan}/{total} ({has_loan/total*100:.1f}%)")
-    print(f"  Total with mtg URL:  {has_mtg}/{total} ({has_mtg/total*100:.1f}%)")
+    print(f'  Total with loan URL: {has_loan:,}/{total:,} ({has_loan/total*100:.1f}%)')
+    print(f'  Total with mtg URL:  {has_mtg:,}/{total:,} ({has_mtg/total*100:.1f}%)')
     conn.close()
 
 
