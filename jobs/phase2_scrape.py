@@ -354,20 +354,20 @@ def insert_rates(conn, inst_id, items, ptype):
 
 def show_stats(conn):
     total    = conn.execute('SELECT COUNT(*) FROM institutions WHERE active=1').fetchone()[0]
-    has_loan = conn.execute("SELECT COUNT(DISTINCT institution_id) FROM rates r JOIN institutions i ON i.id=r.institution_id WHERE product LIKE '%auto%' OR product='personal_loan'").fetchone()[0]
-    has_mtg  = conn.execute("SELECT COUNT(DISTINCT institution_id) FROM rates r JOIN institutions i ON i.id=r.institution_id WHERE product LIKE 'mortgage%'").fetchone()[0]
+    has_dep  = conn.execute("SELECT COUNT(DISTINCT institution_id) FROM rates WHERE product IN ('cd','savings','money_market','checking','ira_cd')").fetchone()[0]
+    has_loan = conn.execute("SELECT COUNT(DISTINCT institution_id) FROM rates WHERE product LIKE '%auto%' OR product='personal_loan'").fetchone()[0]
+    has_mtg  = conn.execute("SELECT COUNT(DISTINCT institution_id) FROM rates WHERE product LIKE 'mortgage%'").fetchone()[0]
     rows     = conn.execute('SELECT COUNT(*) FROM rates').fetchone()[0]
     scraped  = conn.execute("SELECT COUNT(*) FROM institutions WHERE last_scraped_at IS NOT NULL AND active=1").fetchone()[0]
-    no_rates = conn.execute("SELECT COUNT(*) FROM institutions WHERE loan_scrape_status='no_rates' AND active=1").fetchone()[0]
     print(f"""
-=== Coverage ===
-Total institutions:   {total:,}
-Scraped (attempted):  {scraped:,} ({scraped/total*100:.1f}%)
-No-rates (confirmed): {no_rates:,}
-With loan rates:      {has_loan:,} ({has_loan/total*100:.1f}%)
-With mortgage rates:  {has_mtg:,} ({has_mtg/total*100:.1f}%)
-Total rate rows:      {rows:,}
-Remaining:            {total-scraped:,}
+=== Strum Rate Intelligence Coverage ===
+Total active institutions: {total:,}
+Scraped (attempted):       {scraped:,} ({scraped/total*100:.1f}%)
+With deposit rates:        {has_dep:,} ({has_dep/total*100:.1f}%)
+With loan rates:           {has_loan:,} ({has_loan/total*100:.1f}%)
+With mortgage rates:       {has_mtg:,} ({has_mtg/total*100:.1f}%)
+Total rate rows:           {rows:,}
+Unscraped remaining:       {total-scraped:,}
 """)
 
 
@@ -396,22 +396,24 @@ def main():
     stale_cutoff = (datetime.datetime.now() - datetime.timedelta(days=args.stale_days)).isoformat()
 
     if args.check_stale:
-        # Re-check institutions whose rates are old — find broken URLs
+        # Re-check institutions not scraped recently — catch broken URLs
         where = f"""WHERE i.active=1
             AND i.last_scraped_at < '{stale_cutoff}'
-            AND (i.loan_rates_url IS NOT NULL OR i.mortgage_rates_url IS NOT NULL)
+            AND (i.rates_url IS NOT NULL OR i.loan_rates_url IS NOT NULL OR i.mortgage_rates_url IS NOT NULL)
             {type_filter}"""
     elif args.playwright_only:
         where = f"WHERE i.active=1 AND (i.loan_scrape_status='no_rates' OR i.mortgage_scrape_status='no_rates') {type_filter}"
     else:
-        # Normal: process institutions with URLs not yet scraped
-        where = f"WHERE i.active=1 AND i.last_scraped_at IS NULL AND (i.loan_rates_url IS NOT NULL OR i.mortgage_rates_url IS NOT NULL) {type_filter}"
+        # Normal: process institutions with any URL not yet scraped
+        where = f"""WHERE i.active=1 AND i.last_scraped_at IS NULL
+            AND (i.rates_url IS NOT NULL OR i.loan_rates_url IS NOT NULL OR i.mortgage_rates_url IS NOT NULL)
+            {type_filter}"""
 
     institutions = conn.execute(f"""
         SELECT i.id, i.name, i.type, i.website_url, i.rates_url,
                i.loan_rates_url, i.mortgage_rates_url,
-               i.loan_raw_section, i.mortgage_raw_section,
-               i.loan_scrape_status, i.mortgage_scrape_status,
+               i.raw_section, i.loan_raw_section, i.mortgage_raw_section,
+               i.scrape_status, i.loan_scrape_status, i.mortgage_scrape_status,
                i.last_scraped_at
         FROM institutions i
         {where}
@@ -421,31 +423,63 @@ def main():
 
     use_playwright = True
 
-    print(f"[Phase 2] Scraping {len(institutions)} institutions (playwright={'playwright-only' if args.playwright_only else 'fallback'})")
+    print(f"[Phase 2] Scraping {len(institutions)} institutions — deposits + loans + mortgages", flush=True)
 
-    total_loan = total_mtg = 0
+    total_dep = total_loan = total_mtg = 0
 
     for i, inst in enumerate(institutions):
-        inst_id    = inst['id']
-        name       = inst['name']
-        inst_type  = inst['type']
-        website    = inst['website_url'] or ''
-        domain     = re.sub(r'^https?://(www\.)?', '', website).split('/')[0]
+        inst_id     = inst['id']
+        name        = inst['name']
+        inst_type   = inst['type']
+        website     = inst['website_url'] or ''
+        domain      = re.sub(r'^https?://(www\.)?', '', website).split('/')[0]
         deposit_url = inst['rates_url']
+        loan_url    = inst['loan_rates_url']
+        mtg_url     = inst['mortgage_rates_url']
 
         if any(k in name.lower() for k in SKIP_KEYWORDS):
             conn.execute('UPDATE institutions SET last_scraped_at=? WHERE id=?', (NOW, inst_id))
             conn.commit()
             continue
 
-        # In stale-check mode, always re-scrape regardless of existing rates
         force = args.check_stale
 
+        ex_dep  = conn.execute("SELECT COUNT(*) FROM rates WHERE institution_id=? AND product IN ('cd','savings','money_market','checking','ira_cd')", (inst_id,)).fetchone()[0]
         ex_loan = conn.execute("SELECT COUNT(*) FROM rates WHERE institution_id=? AND (product LIKE '%auto%' OR product='personal_loan')", (inst_id,)).fetchone()[0]
         ex_mtg  = conn.execute("SELECT COUNT(*) FROM rates WHERE institution_id=? AND product LIKE 'mortgage%'", (inst_id,)).fetchone()[0]
 
-        loan_url = inst['loan_rates_url']
-        mtg_url  = inst['mortgage_rates_url']
+        # ── Deposits ───────────────────────────────────────────────────────────
+        if deposit_url and (not ex_dep or force):
+            raw, method, final_url = scrape_with_stale_detection(
+                deposit_url, inst_id, name, domain, 'deposit', inst_type, None, conn)
+            if raw and method not in ('no_rates', 'stale_url'):
+                conn.execute('UPDATE institutions SET raw_section=?, scrape_status=? WHERE id=?',
+                            (raw[:25000], 'ok', inst_id))
+                conn.commit()
+                extracted, model_used, quality = gpt_extract(raw, 'deposit', name)
+                # Insert deposit rates (apy field from deposit prompt)
+                n = 0
+                for r in extracted:
+                    apy = normalize(r.get('apy'))
+                    if apy is None: continue
+                    prod = r.get('product', 'savings')
+                    try:
+                        conn.execute("""INSERT OR IGNORE INTO rates
+                            (institution_id,scraped_at,scraped_week,product,apy,
+                             term_months,min_balance,notes,confidence)
+                            VALUES(?,?,?,?,?,?,?,?,?)""",
+                            (inst_id,NOW,SCRAPED_WEEK,prod,apy,
+                             r.get('term_months'),r.get('min_balance'),
+                             r.get('notes'),'unverified'))
+                        n += 1
+                    except: pass
+                conn.commit()
+                total_dep += n
+                flag = '⬆' if model_used == MODEL_STRONG else ''
+                if n: print(f'  DEP  {name}: {n} rates | q={quality}{flag} ({method})', flush=True)
+            else:
+                conn.execute('UPDATE institutions SET scrape_status=? WHERE id=?', ('no_rates', inst_id))
+                conn.commit()
 
         # ── Loans ──────────────────────────────────────────────────────────────
         if loan_url and (not ex_loan or force):
@@ -504,7 +538,7 @@ def main():
         if (i + 1) % 100 == 0:
             print(f'  [{i+1}/{len(institutions)}] loan={total_loan} mtg={total_mtg}')
 
-    print(f'\n[Phase 2 DONE] loan_rates={total_loan} mtg_rates={total_mtg}')
+    print(f'\n[Phase 2 DONE] dep_rates={total_dep} loan_rates={total_loan} mtg_rates={total_mtg}')
     show_stats(conn)
     conn.close()
 
