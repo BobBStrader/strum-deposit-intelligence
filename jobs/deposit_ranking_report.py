@@ -479,7 +479,7 @@ def render_text_report(conn, city: str, state: str, client_name: str,
     lines = []
     lines.append("=" * 70)
     lines.append(f"  {client_name}")
-    lines.append(f"  Deposit Ranking Report — Powered by Strum Platform")
+    lines.append(f"  Deposit Ranking Report — Strum Rate Intelligence™")
     lines.append(f"  Market: {market_label}")
     if cbsa_code:
         lines.append(f"  MSA/CBSA Code: {cbsa_code}")
@@ -552,7 +552,7 @@ def render_text_report(conn, city: str, state: str, client_name: str,
                 lines.append(f"  {'Rate Group Average':<42} {avg*100:.2f}%")
 
     lines.append(f"\n{'='*70}")
-    lines.append(f"  © {date.today().year}, Powered by Strum Platform")
+    lines.append(f"  © {date.today().year}, Strum Rate Intelligence™")
     lines.append(f"  Data sourced from public institution websites")
     lines.append("=" * 70)
     return "\n".join(lines)
@@ -625,7 +625,7 @@ def render_pdf_report(conn, city: str, state: str, client_name: str,
     story.append(HRFlowable(width="100%", thickness=2, color=GOLD, spaceAfter=6))
     msa_suffix = f"  |  MSA/CBSA: {cbsa_code}" if cbsa_code else ""
     story.append(Paragraph(
-        f"Market: {market_label}{msa_suffix}  |  Generated: {today}  |  Powered by Strum Platform",
+        f"Market: {market_label}{msa_suffix}  |  Generated: {today}  |  Strum Rate Intelligence™",
         sub_style))
     story.append(Spacer(1, 0.15*inch))
 
@@ -793,7 +793,7 @@ def render_pdf_report(conn, city: str, state: str, client_name: str,
     story.append(Spacer(1, 0.2*inch))
     story.append(HRFlowable(width="100%", thickness=1, color=GOLD))
     story.append(Paragraph(
-        f"© {date.today().year}, Powered by Strum Platform  |  "
+        f"© {date.today().year}, Strum Rate Intelligence™  |  "
         f"Data sourced from public institution websites  |  "
         f"Generated {today}",
         ParagraphStyle("footer", fontSize=7, textColor=GRAY,

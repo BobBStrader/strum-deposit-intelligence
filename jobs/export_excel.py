@@ -144,7 +144,7 @@ def build_excel(client_name, city, state, output_path):
     ws_cover.cell(row=5, column=1, value=f"Market: {city}, {state}").font = Font(size=13)
     ws_cover.cell(row=6, column=1, value=f"Generated: {today}").font = Font(size=11, color="666666")
     ws_cover.cell(row=7, column=1, value=f"Peers: {len(peers)} institutions").font = Font(size=11, color="666666")
-    ws_cover.cell(row=9, column=1, value="Powered by Strum Platform™").font = Font(size=10, italic=True, color="999999")
+    ws_cover.cell(row=9, column=1, value="Strum Rate Intelligence™™").font = Font(size=10, italic=True, color="999999")
 
     def add_sheet_logo(ws):
         if os.path.exists(logo_path):

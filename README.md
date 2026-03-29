@@ -1,7 +1,7 @@
-# Strum Deposit Intelligence
+# Strum Rate Intelligence
 ### A Strum Platform™ Feature
 
-A competitive rate intelligence platform that automatically generates ranking reports showing how a client credit union or bank compares to local market peers across **deposits, auto loans, and mortgages**. Modeled after S&P Global's Deposit and Loan Ranking Reports. Delivered as a Strum Platform add-on module.
+Automated competitive rate intelligence — generates peer ranking reports showing how a client credit union or bank compares to local market competitors across **deposits, auto loans, and mortgages**. Modeled after S&P Global's Deposit and Loan Ranking Reports ($21K–$217K/year). Delivered as a Strum Platform add-on module at a fraction of the cost.
 
 ---
 
@@ -24,7 +24,7 @@ A competitive rate intelligence platform that automatically generates ranking re
 |---|---|
 | **S&P Global Deposit Ranking Report** | $21K–$217K/year (median **$53,344**, based on 47 purchases via Vendr) |
 | **S&P Global Loan Ranking Report** | Similar pricing — separate SKU |
-| **Strum Platform opportunity** | $3–5K/year per client per report type — undercutting S&P by **80%+** |
+| **Strum Rate Intelligence** | $3–5K/year per client per report type — undercutting S&P by **80%+** |
 | **Data costs** | ~$0 — all data sourced from public websites via web scraping + GPT extraction |
 
 This tool replicates the core value proposition of S&P's product: auto-generated, peer-ranked rate comparisons delivered as professional PDF reports. The key differentiator is that we source data from public websites rather than paying data vendors ($500–$2,000+/mo for Datatrac, S&P's underlying source), which makes the unit economics dramatically better.
