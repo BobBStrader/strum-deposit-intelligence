@@ -144,10 +144,57 @@ def brave_search(query, count=5):
         return []
 
 
+# Common rate page paths to try as a last resort when Brave finds nothing on-domain
+FALLBACK_PATHS = {
+    'deposit': [
+        '/rates', '/current-rates', '/rate-center', '/rates/savings',
+        '/rates/deposit', '/rates.html', '/rates.php', '/rates.asp',
+        '/personal/rates', '/banking/rates', '/resources/rates',
+        '/deposit-rates', '/savings-rates', '/cd-rates',
+        '/tools/rates', '/services/rates', '/member-rates',
+    ],
+    'loan': [
+        '/rates', '/loan-rates', '/rates/loan', '/rates/auto',
+        '/rates/vehicle', '/lending-rates', '/borrow/rates',
+        '/personal/loan-rates', '/personal-loans/rates',
+        '/rates.html', '/rates.php', '/rates.asp',
+        '/consumer-loans/rates', '/auto-loan-rates',
+    ],
+    'mortgage': [
+        '/mortgage-rates', '/rates/mortgage', '/home-loan-rates',
+        '/rates/home', '/mortgage/rates', '/rates/real-estate',
+        '/personal/mortgage-rates', '/home-lending/rates',
+        '/rates.html', '/rates', '/rate-center',
+    ],
+}
+
+
+def check_fallback_paths(domain, ptype, min_score=20):
+    """Try common rate page paths on the institution's own domain."""
+    import requests
+    paths = FALLBACK_PATHS.get(ptype, [])
+    for path in paths:
+        url = f'https://www.{domain}{path}'
+        try:
+            r = requests.head(url, timeout=5, allow_redirects=True,
+                             headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 200:
+                # Score it — it's on-domain by definition so starts high
+                score = score_url(url, '', '', domain, ptype)
+                if score >= min_score:
+                    return url, score
+        except:
+            continue
+        time.sleep(0.05)
+    return None, 0
+
+
 def find_best_url(name, domain, ptype, inst_type):
     """
     Run 2-3 Brave queries with different phrasings, score all results,
-    return the highest-scoring URL.
+    return the highest-scoring URL. Requires same-domain for acceptance.
+    Falls back to path probing on the institution's own website if Brave
+    can't find an on-domain result.
     """
     # Build query variants — different phrasings catch different sites
     if ptype == 'loan':
@@ -218,11 +265,19 @@ def find_best_url(name, domain, ptype, inst_type):
 
     ranked = sorted(seen.items(), key=lambda x: x[1][0], reverse=True)
 
-    if not ranked:
-        return None, 0
+    # Only accept same-domain results — reject aggregators (Bankrate, WalletHub, etc.)
+    for url, (score, title) in ranked:
+        u_domain = re.sub(r'^https?://(www\.)?', '', url).split('/')[0].lower()
+        if domain and domain.lower() in u_domain and score >= 30:
+            return url, score
 
-    best_url, (best_score, best_title) = ranked[0]
-    return best_url, best_score
+    # No good on-domain result from Brave — try common path patterns directly
+    if domain:
+        fallback_url, fallback_score = check_fallback_paths(domain, ptype)
+        if fallback_url:
+            return fallback_url, fallback_score
+
+    return None, 0
 
 
 def get_db():
