@@ -189,14 +189,90 @@ def check_fallback_paths(domain, ptype, min_score=20):
     return None, 0
 
 
-def find_best_url(name, domain, ptype, inst_type):
+def derive_urls_from_deposit(deposit_url, ptype):
     """
-    Run 2-3 Brave queries with different phrasings, score all results,
-    return the highest-scoring URL. Requires same-domain for acceptance.
-    Falls back to path probing on the institution's own website if Brave
-    can't find an on-domain result.
+    Given a known deposit rates URL, derive likely loan/mortgage URLs.
+
+    If deposit URL is:  https://somecu.org/rates/savings
+    Loan likely at:     https://somecu.org/rates/loans  OR  /rates/auto
+    Mortgage likely at: https://somecu.org/rates/mortgage OR /rates/home
+
+    Returns list of candidate URLs to check (HEAD requests).
     """
-    # Build query variants — different phrasings catch different sites
+    if not deposit_url:
+        return []
+
+    u = deposit_url.lower()
+    base = deposit_url.rstrip('/')
+
+    # Strip the last path segment to get the rates section base
+    parts = base.split('/')
+    rates_base = '/'.join(parts[:-1]) if len(parts) > 3 else base
+
+    candidates = []
+
+    if ptype == 'loan':
+        # Sibling paths under same rates section
+        for suffix in ['loans', 'auto', 'auto-loans', 'vehicle', 'loan-rates',
+                       'consumer', 'personal-loan', 'borrow', 'lending']:
+            candidates.append(f'{rates_base}/{suffix}')
+        # Also try replacing the deposit-specific segment
+        for old, new in [('savings','loans'), ('deposit','loans'), ('cd','loans'),
+                         ('certificates','loans'), ('savings-rates','loan-rates'),
+                         ('deposit-rates','loan-rates'), ('cd-rates','loan-rates')]:
+            if old in u:
+                candidates.append(deposit_url.replace(old, new))
+                candidates.append(deposit_url.lower().replace(old, 'auto-loans'))
+
+    elif ptype == 'mortgage':
+        for suffix in ['mortgage', 'mortgages', 'home-loans', 'home-loan-rates',
+                       'real-estate', 'mortgage-rates', 'home']:
+            candidates.append(f'{rates_base}/{suffix}')
+        for old, new in [('savings','mortgage'), ('deposit','mortgage'), ('cd','mortgage'),
+                         ('savings-rates','mortgage-rates'), ('deposit-rates','mortgage-rates'),
+                         ('loan-rates','mortgage-rates'), ('loans','mortgage')]:
+            if old in u:
+                candidates.append(deposit_url.replace(old, new))
+
+    return candidates
+
+
+def check_derived_urls(deposit_url, domain, ptype):
+    """Check deposit-URL-derived candidates with HEAD requests."""
+    candidates = derive_urls_from_deposit(deposit_url, ptype)
+    seen = set()
+    for url in candidates:
+        if url in seen or not url.startswith('http'):
+            continue
+        seen.add(url)
+        try:
+            r = requests.head(url, timeout=4, allow_redirects=True,
+                             headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 200:
+                score = score_url(url, '', '', domain, ptype)
+                if score >= 20:
+                    return url, score
+        except:
+            pass
+        time.sleep(0.04)
+    return None, 0
+
+
+def find_best_url(name, domain, ptype, inst_type, deposit_url=None):
+    """
+    URL discovery with 4 layers:
+    1. Derive from deposit URL (free, instant) — if deposit URL known
+    2. Brave search (3 query variants, scored)
+    3. Fallback path probing on institution domain
+    Returns (url, score).
+    """
+    # Layer 1: Derive from known deposit URL (free, no API call)
+    if deposit_url and ptype in ('loan', 'mortgage'):
+        url, score = check_derived_urls(deposit_url, domain, ptype)
+        if url and score >= 30:
+            return url, score
+
+    # Layer 2: Brave search — build query variants
     if ptype == 'loan':
         if inst_type == 'cu':
             queries = [
@@ -346,27 +422,32 @@ def main():
             else:
                 dep_skipped += 1
 
+        # Use deposit URL as a hint for loan/mortgage discovery
+        dep_url = inst['rates_url']
+
         # ── Loan URL ──────────────────────────────────────────────────────────
         if not inst['loan_rates_url'] or args.reset:
-            url, score = find_best_url(name, domain, 'loan', inst_type)
+            url, score = find_best_url(name, domain, 'loan', inst_type, deposit_url=dep_url)
             if url and score >= args.min_score:
                 conn.execute('UPDATE institutions SET loan_rates_url=? WHERE id=?', (url, inst['id']))
                 conn.commit()
                 loan_found += 1
+                src = '(from deposit URL)' if dep_url and url.split('/')[2] in dep_url else ''
                 if score >= 60:
-                    print(f'  LOAN ✅ {name}: {url} (score={score})', flush=True)
+                    print(f'  LOAN ✅ {name}: {url} (score={score}) {src}', flush=True)
             else:
                 loan_skipped += 1
 
         # ── Mortgage URL ──────────────────────────────────────────────────────
         if not inst['mortgage_rates_url'] or args.reset:
-            url, score = find_best_url(name, domain, 'mortgage', inst_type)
+            url, score = find_best_url(name, domain, 'mortgage', inst_type, deposit_url=dep_url)
             if url and score >= args.min_score:
                 conn.execute('UPDATE institutions SET mortgage_rates_url=? WHERE id=?', (url, inst['id']))
                 conn.commit()
                 mtg_found += 1
+                src = '(from deposit URL)' if dep_url and url.split('/')[2] in dep_url else ''
                 if score >= 60:
-                    print(f'  MTG  ✅ {name}: {url} (score={score})', flush=True)
+                    print(f'  MTG  ✅ {name}: {url} (score={score}) {src}', flush=True)
             else:
                 mtg_skipped += 1
 
